@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
@@ -15,6 +14,7 @@ from alt_hot_scanner.data.binance_public import (
     validate_archive_object_key,
     write_json_exclusive,
 )
+from alt_hot_scanner.universe.authorization import verify_bound_plan
 
 
 def key_fields(object_key: str) -> dict[str, str]:
@@ -87,9 +87,8 @@ def main() -> None:
         raise ValueError("--workers must be between 1 and 16")
     root = Path(__file__).resolve().parents[1]
     plan_path = root / args.plan
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    if type(plan) is not dict or type(plan.get("objects")) is not list:
-        raise ValueError("Plan must contain an objects list")
+    verified_plan = verify_bound_plan(plan_path)
+    plan = verified_plan["plan"]
     if args.limit is not None and args.limit < 0:
         raise ValueError("--limit must not be negative")
     selected = plan["objects"][: args.limit]

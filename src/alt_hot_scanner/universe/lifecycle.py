@@ -4,12 +4,13 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from alt_hot_scanner.identity import require_binance_token
 
-CATALOG_SCHEMA_VERSION = "binance-usdm-lifecycle-v1"
-PARSER_VERSION = "lifecycle-catalog-v1"
+CATALOG_SCHEMA_VERSION = "binance-usdm-lifecycle-v2"
+PARSER_VERSION = "lifecycle-catalog-v2"
 
 CATALOG_COLUMNS = [
     "catalog_schema_version",
@@ -26,6 +27,10 @@ CATALOG_COLUMNS = [
     "is_crypto_underlying",
     "is_stablecoin_underlying",
     "is_leveraged_token",
+    "stablecoin_evidence_status",
+    "stablecoin_conflict_status",
+    "leveraged_evidence_status",
+    "leveraged_conflict_status",
     "is_benchmark_btc",
     "is_eth",
     "scope_classification_status",
@@ -41,6 +46,14 @@ CATALOG_COLUMNS = [
     "last_valid_kline_at",
     "exchange_info_delivery_at",
     "latest_known_status",
+    "present_in_current_exchange_info",
+    "scope_classification_complete",
+    "listing_start_complete",
+    "delisting_evidence_state",
+    "current_status_warning",
+    "onboard_start_discrepancy_seconds",
+    "onboard_start_discrepancy_status",
+    "historical_inclusion_readiness",
     "listing_evidence_status",
     "listing_source_type",
     "listing_source_url",
@@ -85,6 +98,16 @@ def _null_record(symbol: str, created_at: pd.Timestamp) -> dict[str, Any]:
         "scope_classification_status": "unresolved",
         "listing_evidence_status": "unresolved",
         "delisting_evidence_status": "unresolved",
+        "stablecoin_evidence_status": "unresolved",
+        "stablecoin_conflict_status": "none",
+        "leveraged_evidence_status": "unresolved",
+        "leveraged_conflict_status": "none",
+        "scope_classification_complete": False,
+        "listing_start_complete": False,
+        "delisting_evidence_state": "not_investigated",
+        "onboard_start_discrepancy_status": "not_comparable",
+        "historical_inclusion_readiness": "blocked",
+        "present_in_current_exchange_info": False,
         "catalog_created_at": created_at,
     }
 
@@ -114,6 +137,7 @@ def build_lifecycle_catalog(
     announcement_evidence: pd.DataFrame | None = None,
     *,
     created_at: pd.Timestamp | None = None,
+    announcement_search_completed: bool | None = None,
 ) -> pd.DataFrame:
     """Merge distinct evidence tiers without promoting observed bounds into exact events."""
     required_archive = {
@@ -133,6 +157,11 @@ def build_lifecycle_catalog(
         raise ValueError("Current exchangeInfo must have one row per symbol")
 
     evidence = announcement_evidence if announcement_evidence is not None else pd.DataFrame()
+    search_completed = (
+        announcement_evidence is not None
+        if announcement_search_completed is None
+        else announcement_search_completed
+    )
     created = created_at or pd.Timestamp(datetime.now(UTC))
     current_by_symbol = (
         exchange_info_records.set_index("symbol", drop=False)
@@ -162,6 +191,7 @@ def build_lifecycle_catalog(
 
         if not current_by_symbol.empty and symbol in current_by_symbol.index:
             current = current_by_symbol.loc[symbol]
+            record["present_in_current_exchange_info"] = True
             for column in [
                 "base_asset",
                 "quote_asset",
@@ -173,6 +203,10 @@ def build_lifecycle_catalog(
                 "is_crypto_underlying",
                 "is_stablecoin_underlying",
                 "is_leveraged_token",
+                "stablecoin_evidence_status",
+                "stablecoin_conflict_status",
+                "leveraged_evidence_status",
+                "leveraged_conflict_status",
                 "is_benchmark_btc",
                 "is_eth",
                 "scope_classification_status",
@@ -234,6 +268,67 @@ def build_lifecycle_catalog(
                 }
             )
 
+        classification_complete = (
+            record["scope_classification_status"] != "unresolved"
+            and isinstance(record["is_stablecoin_underlying"], (bool, np.bool_))
+            and isinstance(record["is_leveraged_token"], (bool, np.bool_))
+            and record["stablecoin_conflict_status"] != "conflict"
+            and record["leveraged_conflict_status"] != "conflict"
+        )
+        listing_complete = record["official_trading_start_at"] is not None
+        is_current = record["present_in_current_exchange_info"] is True
+        status = record["latest_known_status"]
+        is_trading = is_current and status == "TRADING"
+        needs_delisting = is_current and status != "TRADING"
+        exact_delisting = record["delisting_announcement_published_at"] is not None
+        if exact_delisting:
+            delisting_state = "exact_applicable_announcement_publication"
+        elif is_trading:
+            delisting_state = "not_applicable_currently_trading"
+        elif needs_delisting:
+            delisting_state = "unresolved_current_non_trading_without_announcement"
+        elif search_completed:
+            delisting_state = "searched_official_sources_no_exact_announcement_found"
+        else:
+            delisting_state = "not_investigated"
+        onboard = record["exchange_info_onboard_at"]
+        official = record["official_trading_start_at"]
+        if onboard is not None and official is not None:
+            difference = abs(
+                (pd.Timestamp(official) - pd.Timestamp(onboard)).total_seconds()
+            )
+            discrepancy_status = (
+                "consistent_within_engineering_threshold"
+                if difference <= 3600
+                else "unresolved_material_discrepancy"
+            )
+        else:
+            difference = None
+            discrepancy_status = "not_comparable"
+        delisting_ready = is_trading or exact_delisting or (
+            not is_current
+            and delisting_state == "searched_official_sources_no_exact_announcement_found"
+        )
+        ready = (
+            classification_complete
+            and listing_complete
+            and delisting_ready
+            and discrepancy_status != "unresolved_material_discrepancy"
+        )
+        record.update(
+            {
+                "scope_classification_complete": classification_complete,
+                "listing_start_complete": listing_complete,
+                "delisting_evidence_state": delisting_state,
+                "current_status_warning": (
+                    None if is_trading else f"current_status_{status or 'archive_only'}"
+                ),
+                "onboard_start_discrepancy_seconds": difference,
+                "onboard_start_discrepancy_status": discrepancy_status,
+                "historical_inclusion_readiness": "ready" if ready else "blocked",
+            }
+        )
+
         records.append(record)
     catalog = pd.DataFrame.from_records(records, columns=CATALOG_COLUMNS)
     return catalog.sort_values("symbol").reset_index(drop=True)
@@ -245,13 +340,13 @@ def catalog_coverage(catalog: pd.DataFrame) -> dict[str, Any]:
     if forbidden & set(catalog.columns):
         raise ValueError("Lifecycle coverage cannot consume scanner or outcome data")
     usdt = catalog["quote_asset"].eq("USDT") | catalog["symbol"].str.endswith("USDT")
-    current = catalog["metadata_acquired_at"].notna()
-    resolved = catalog["scope_classification_status"].ne("unresolved")
+    current = catalog["present_in_current_exchange_info"].eq(True)
+    resolved = catalog["scope_classification_complete"].eq(True)
     exact_listing = catalog["official_trading_start_at"].notna()
     exact_delist_publication = catalog["delisting_announcement_published_at"].notna()
     exact_last_trading = catalog["official_last_trading_at"].notna()
-    lifecycle_unresolved = usdt & ~(exact_listing & (current | exact_delist_publication))
-    quarantined = usdt & ~(resolved & exact_listing)
+    lifecycle_unresolved = usdt & catalog["historical_inclusion_readiness"].ne("ready")
+    quarantined = lifecycle_unresolved
 
     def segment(mask: pd.Series) -> dict[str, int]:
         return {
@@ -283,6 +378,10 @@ def catalog_coverage(catalog: pd.DataFrame) -> dict[str, Any]:
         "unresolved_classification_cases": int((usdt & ~resolved).sum()),
         "unresolved_lifecycle_cases": int(lifecycle_unresolved.sum()),
         "currently_quarantined": int(quarantined.sum()),
+        "historical_inclusion_ready": int(
+            (usdt & catalog["historical_inclusion_readiness"].eq("ready")).sum()
+        ),
+        "authorization_ready": not bool(quarantined.any()),
         "unresolved_categories": {
             "usdt_missing_exact_official_trading_start": int((usdt & ~exact_listing).sum()),
             "usdt_missing_scope_classification": int((usdt & ~resolved).sum()),
@@ -292,6 +391,29 @@ def catalog_coverage(catalog: pd.DataFrame) -> dict[str, Any]:
             "no_accepted_listing_article": int(catalog["listing_article_id"].isna().sum()),
             "archive_only_without_exact_delisting_announcement": int(
                 (archive_only & ~exact_delist_publication).sum()
+            ),
+            "current_non_trading_without_exact_delisting_announcement": int(
+                (retained_non_trading & ~exact_delist_publication).sum()
+            ),
+            "stablecoin_classification_unresolved": int(
+                (usdt & catalog["is_stablecoin_underlying"].isna()).sum()
+            ),
+            "leveraged_classification_unresolved": int(
+                (usdt & catalog["is_leveraged_token"].isna()).sum()
+            ),
+            "stablecoin_classification_conflicts": int(
+                (usdt & catalog["stablecoin_conflict_status"].eq("conflict")).sum()
+            ),
+            "leveraged_classification_conflicts": int(
+                (usdt & catalog["leveraged_conflict_status"].eq("conflict")).sum()
+            ),
+            "unresolved_onboard_start_discrepancies": int(
+                (
+                    usdt
+                    & catalog["onboard_start_discrepancy_status"].eq(
+                        "unresolved_material_discrepancy"
+                    )
+                ).sum()
             ),
         },
         "segments": {

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 
+import numpy as np
 import pandas as pd
 
 from alt_hot_scanner.identity import (
@@ -12,6 +12,7 @@ from alt_hot_scanner.identity import (
     require_identity_sequence,
     require_stablecoin_underlyings,
 )
+from alt_hot_scanner.utils.numeric import strict_millisecond_timestamp
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,10 @@ class ContractRecord:
     is_crypto_underlying: bool | None
     is_stablecoin_underlying: bool | None
     is_leveraged_token: bool | None
+    stablecoin_evidence_status: str
+    stablecoin_conflict_status: str
+    leveraged_evidence_status: str
+    leveraged_conflict_status: str
     is_benchmark_btc: bool | None
     is_eth: bool | None
     scope_classification_status: str
@@ -47,9 +52,32 @@ def records_from_exchange_info(
     *,
     raw_snapshot_path: str | None = None,
     raw_snapshot_sha256: str | None = None,
+    stablecoin_underlyings: list[str] | None = None,
+    reviewed_classification: list[dict] | None = None,
 ) -> pd.DataFrame:
     """Normalize current exchangeInfo while retaining its current-snapshot provenance."""
-    acquired = acquired_at or pd.Timestamp(datetime.now(UTC))
+    acquired = acquired_at
+    configured_stablecoins = (
+        require_stablecoin_underlyings(stablecoin_underlyings)
+        if stablecoin_underlyings is not None
+        else frozenset()
+    )
+    reviewed_by_key: dict[tuple[str, str], dict] = {}
+    for evidence in reviewed_classification or []:
+        asset = require_binance_token(evidence.get("asset"), "classification asset")
+        dimension = evidence.get("dimension")
+        if dimension not in {"stablecoin_underlying", "leveraged_token"}:
+            raise ValueError("Classification evidence has an unsupported dimension")
+        if type(evidence.get("value")) is not bool:
+            raise ValueError("Classification evidence value must be boolean")
+        if evidence.get("evidence_status") != "accepted_reviewed":
+            raise ValueError("Classification evidence must be accepted and reviewed")
+        for field in ("source_type", "source_identifier", "reviewed_parser_version"):
+            require_canonical_text(evidence.get(field), f"classification {field}")
+        key = (asset, dimension)
+        if key in reviewed_by_key:
+            raise ValueError("Duplicate reviewed classification evidence")
+        reviewed_by_key[key] = evidence
     records: list[dict] = []
     for item in payload["symbols"]:
         delivery_ms = item.get("deliveryDate")
@@ -79,6 +107,80 @@ def records_from_exchange_info(
             if classification_fields_valid and underlying_subtype is not None
             else set()
         )
+        metadata_stable_positive = "STABLECOIN" in normalized_subtypes
+        metadata_leveraged_positive = any(
+            "LEVERAGED" in subtype for subtype in normalized_subtypes
+        )
+        stable_review = (
+            reviewed_by_key.get((base_asset, "stablecoin_underlying"))
+            if type(base_asset) is str
+            else None
+        )
+        leveraged_review = (
+            reviewed_by_key.get((symbol, "leveraged_token")) if type(symbol) is str else None
+        )
+        stable_values = [
+            value
+            for value in (
+                True if metadata_stable_positive else None,
+                True if type(base_asset) is str and base_asset in configured_stablecoins else None,
+                stable_review.get("value") if stable_review else None,
+            )
+            if value is not None
+        ]
+        leveraged_values = [
+            value
+            for value in (
+                True if metadata_leveraged_positive else None,
+                leveraged_review.get("value") if leveraged_review else None,
+            )
+            if value is not None
+        ]
+        stable_conflict = len(set(stable_values)) > 1
+        leveraged_conflict = len(set(leveraged_values)) > 1
+        stable_value = stable_values[0] if stable_values and not stable_conflict else None
+        leveraged_value = (
+            leveraged_values[0] if leveraged_values and not leveraged_conflict else None
+        )
+        stable_status = (
+            "conflicting_affirmative_evidence"
+            if stable_conflict
+            else "accepted_reviewed_evidence"
+            if stable_review
+            else "affirmative_configured_positive_guard"
+            if type(base_asset) is str and base_asset in configured_stablecoins
+            else "affirmative_exchange_info_subtype"
+            if metadata_stable_positive
+            else "unresolved_no_affirmative_negative_evidence"
+        )
+        leveraged_status = (
+            "conflicting_affirmative_evidence"
+            if leveraged_conflict
+            else "accepted_reviewed_evidence"
+            if leveraged_review
+            else "affirmative_exchange_info_subtype"
+            if metadata_leveraged_positive
+            else "unresolved_no_affirmative_negative_evidence"
+        )
+        onboard_ms = (
+            strict_millisecond_timestamp(item.get("onboardDate"), "onboardDate")
+            if item.get("onboardDate") is not None
+            else None
+        )
+        delivery_at = None
+        if delivery_ms is not None:
+            delivery_at = pd.to_datetime(
+                strict_millisecond_timestamp(delivery_ms, "deliveryDate"),
+                unit="ms",
+                utc=True,
+            )
+        classification_resolved = (
+            classification_fields_valid
+            and type(stable_value) is bool
+            and type(leveraged_value) is bool
+            and not stable_conflict
+            and not leveraged_conflict
+        )
         record = ContractRecord(
             symbol=symbol,
             base_asset=base_asset,
@@ -92,30 +194,32 @@ def records_from_exchange_info(
             is_crypto_underlying=(
                 underlying_type == "COIN" if classification_fields_valid else None
             ),
-            is_stablecoin_underlying=(
-                "STABLECOIN" in normalized_subtypes if classification_fields_valid else None
+            is_stablecoin_underlying=(stable_value if classification_fields_valid else None),
+            is_leveraged_token=(leveraged_value if classification_fields_valid else None),
+            stablecoin_evidence_status=(
+                stable_status if classification_fields_valid else "unresolved_invalid_identity"
             ),
-            is_leveraged_token=(
-                any("LEVERAGED" in subtype for subtype in normalized_subtypes)
-                if classification_fields_valid
-                else None
+            stablecoin_conflict_status=("conflict" if stable_conflict else "none"),
+            leveraged_evidence_status=(
+                leveraged_status if classification_fields_valid else "unresolved_invalid_identity"
             ),
+            leveraged_conflict_status=("conflict" if leveraged_conflict else "none"),
             is_benchmark_btc=(symbol == "BTCUSDT" if classification_fields_valid else None),
             is_eth=(symbol == "ETHUSDT" if classification_fields_valid else None),
             scope_classification_status=(
-                "resolved_current_exchange_info" if classification_fields_valid else "unresolved"
+                "resolved_reviewed_evidence" if classification_resolved else "unresolved"
             ),
             scope_classification_provenance=(
-                "binance_exchange_info_underlying_type_and_nonempty_subtype"
-                if classification_fields_valid
+                "versioned_classification_evidence_and_positive_exclusion_guard"
+                if classification_resolved
                 else None
             ),
-            exchange_info_onboard_at=pd.to_datetime(
-                item.get("onboardDate"), unit="ms", utc=True
+            exchange_info_onboard_at=(
+                pd.to_datetime(onboard_ms, unit="ms", utc=True)
+                if onboard_ms is not None
+                else None
             ),
-            exchange_info_delivery_at=(
-                pd.to_datetime(delivery_ms, unit="ms", utc=True) if delivery_ms else None
-            ),
+            exchange_info_delivery_at=delivery_at,
             latest_known_status=item.get("status"),
             metadata_acquired_at=acquired,
             metadata_source="https://fapi.binance.com/fapi/v1/exchangeInfo",
@@ -151,8 +255,11 @@ def filter_instrument_scope(
         raise ValueError(f"Instrument classification is unresolved; missing {sorted(missing)}")
     # Retain configuration validation as a legacy conflict guard, but scope admission
     # depends on captured per-contract evidence rather than list membership.
-    if stablecoin_underlyings is not None:
+    configured_stablecoins = (
         require_stablecoin_underlyings(stablecoin_underlyings)
+        if stablecoin_underlyings is not None
+        else frozenset()
+    )
 
     def valid_row(row: pd.Series) -> bool:
         try:
@@ -173,9 +280,9 @@ def filter_instrument_scope(
             return False
         return (
             symbol == f"{base}{quote}"
-            and type(row["is_crypto_underlying"]) is bool
-            and type(row["is_stablecoin_underlying"]) is bool
-            and type(row["is_leveraged_token"]) is bool
+            and isinstance(row["is_crypto_underlying"], (bool, np.bool_))
+            and isinstance(row["is_stablecoin_underlying"], (bool, np.bool_))
+            and isinstance(row["is_leveraged_token"], (bool, np.bool_))
             and row["scope_classification_status"] != "unresolved"
         )
 
@@ -190,5 +297,6 @@ def filter_instrument_scope(
         & metadata["is_crypto_underlying"].eq(True)
         & metadata["is_stablecoin_underlying"].eq(False)
         & metadata["is_leveraged_token"].eq(False)
+        & ~metadata["base_asset"].isin(configured_stablecoins)
     )
     return metadata.loc[mask].copy()

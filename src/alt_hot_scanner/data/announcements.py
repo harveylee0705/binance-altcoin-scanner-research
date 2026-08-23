@@ -16,11 +16,16 @@ from typing import Any
 import pandas as pd
 
 from alt_hot_scanner.data.binance_public import _read_url, _write_bytes_exclusive_atomic
+from alt_hot_scanner.data.provenance import (
+    load_snapshot_provenance,
+    record_new_snapshot_provenance,
+)
 from alt_hot_scanner.identity import require_binance_token, require_canonical_text
+from alt_hot_scanner.utils.numeric import strict_millisecond_timestamp
 
 ANNOUNCEMENT_API = "https://www.binance.com/bapi/composite/v1/public/cms/article"
 ANNOUNCEMENT_PAGE = "https://www.binance.com/en/support/announcement/detail"
-ANNOUNCEMENT_PARSER_VERSION = "binance-announcement-v1"
+ANNOUNCEMENT_PARSER_VERSION = "binance-announcement-semantic-v2"
 LISTING_CATALOG_ID = 48
 DELISTING_CATALOG_ID = 161
 PAGE_SIZE = 50
@@ -47,13 +52,15 @@ class AnnouncementEvidence:
     symbol: str
     match_status: str
     match_basis: str
+    article_semantic_class: str
+    semantic_evidence_status: str
     article_code: str
     article_title: str
     article_published_at: str
     official_event_at: str | None
     event_time_evidence_status: str
     source_url: str
-    retrieved_at: str
+    retrieved_at: str | None
     raw_snapshot_path: str
     raw_snapshot_sha256: str
     parser_version: str
@@ -102,7 +109,8 @@ def article_plain_text(body: object) -> str:
     else:
         parts: list[str] = []
         _structured_text(parsed, parts)
-    return re.sub(r"\s+", " ", html.unescape(" ".join(parts))).strip()
+    normalized = [re.sub(r"\s+", " ", html.unescape(part)).strip() for part in parts]
+    return "\n".join(part for part in normalized if part)
 
 
 def _symbols_in_order(text: str, archive_symbols: set[str]) -> list[str]:
@@ -124,29 +132,128 @@ def _parse_timestamp(match: re.Match[str]) -> pd.Timestamp:
     ampm = match.group("ampm")
     value = f"{date} {clock} {ampm or ''}".strip()
     if ampm:
+        clock_format = "%I:%M:%S" if clock.count(":") == 2 else "%I:%M"
         parsed = pd.Timestamp(
-            datetime.strptime(value, "%Y-%m-%d %I:%M %p").replace(tzinfo=UTC)
+            datetime.strptime(value, f"%Y-%m-%d {clock_format} %p").replace(tzinfo=UTC)
         )
     else:
         parsed = pd.Timestamp(value, tz="UTC")
     return parsed
 
 
-def _lead_event_times(text: str) -> list[pd.Timestamp]:
-    lowered = text.lower()
-    boundaries = [
-        position
-        for marker in ("more details", "please note", "further information", "risk warning")
-        if (position := lowered.find(marker)) >= 0
-    ]
-    lead = text[: min(boundaries)] if boundaries else text[:4000]
-    matches = [*_DATE_FIRST.finditer(lead), *_TIME_FIRST.finditer(lead)]
+_LAUNCH_ACTION = re.compile(
+    r"\b(?:will\s+)?(?:launch(?:es)?|list(?:s)?|introduce(?:s)?|begin\s+trading|"
+    r"trading\s+(?:will\s+)?start)\b",
+    re.IGNORECASE,
+)
+_DELIST_ACTION = re.compile(
+    r"\b(?:will\s+)?(?:delist|cease\s+trading|settle|close\s+all\s+positions)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_article_semantics(title: str, body_text: str) -> str:
+    """Classify product intent before any exact symbol can become event evidence."""
+    combined = f"{title}\n{body_text[:4000]}".lower()
+    title_lower = title.lower()
+    if "copy trading" in title_lower:
+        return "copy_trading_enablement"
+    if "trading bot" in title_lower or "futures grid" in title_lower:
+        return "trading_bot_enablement"
+    if any(
+        term in title_lower for term in ("portfolio margin", "multi-assets mode", "multi-assets")
+    ):
+        return "portfolio_margin_or_multi_asset_enablement"
+    if "pre-market" in title_lower or "pre market" in title_lower:
+        return "pre_market_or_other_product_enablement"
+    if any(
+        term in title_lower
+        for term in (
+            "leverage and margin tiers",
+            "leverage & margin tiers",
+            "funding rate settlement frequency",
+            "tick size",
+            "contract specifications",
+            "parameter update",
+        )
+    ):
+        return "contract_parameter_update"
+    if any(
+        term in title_lower for term in ("maintenance", "system upgrade", "temporary suspension")
+    ):
+        return "maintenance_or_operational"
+    title_futures_product = "binance futures" in title_lower or "usdⓢ-m futures" in title_lower
+    title_perpetual_product = "perpetual" in title_lower and "contract" in title_lower
+    if title_futures_product and title_perpetual_product and _DELIST_ACTION.search(title_lower):
+        return "delisting_or_settlement"
+    if title_futures_product and title_perpetual_product and _LAUNCH_ACTION.search(title_lower):
+        return "original_perpetual_launch"
+    if "copy trading" in combined:
+        return "copy_trading_enablement"
+    if "trading bot" in combined or "futures grid" in combined:
+        return "trading_bot_enablement"
+    futures_product = "binance futures" in combined or "usdⓢ-m futures" in combined
+    perpetual_product = "perpetual" in combined and "contract" in combined
+    if futures_product and perpetual_product and _DELIST_ACTION.search(combined):
+        return "delisting_or_settlement"
+    if futures_product and perpetual_product and _LAUNCH_ACTION.search(combined):
+        return "original_perpetual_launch"
+    if "futures" in combined or "perpetual" in combined or "contract" in combined:
+        return "ambiguous"
+    return "irrelevant"
+
+
+def _segments(text: str) -> list[str]:
+    segments: list[str] = []
+    for line in text.splitlines():
+        for segment in re.split(r"(?<=[.!?;])\s+", line):
+            if segment.strip():
+                segments.append(segment.strip())
+    return segments
+
+
+def _timestamps_in_segment(segment: str) -> list[pd.Timestamp]:
+    matches = [*_DATE_FIRST.finditer(segment), *_TIME_FIRST.finditer(segment)]
     parsed: list[tuple[int, pd.Timestamp]] = []
     for match in matches:
         timestamp = _parse_timestamp(match)
         if timestamp not in [item[1] for item in parsed]:
             parsed.append((match.start(), timestamp))
     return [timestamp for _, timestamp in sorted(parsed)]
+
+
+def _action_anchored_event_times(
+    text: str,
+    symbols: list[str],
+    semantic_class: str,
+    archive_symbols: set[str],
+) -> dict[str, pd.Timestamp | None]:
+    """Map times only inside an explicit action/symbol structure; never by position/count."""
+    action = _LAUNCH_ACTION if semantic_class == "original_perpetual_launch" else _DELIST_ACTION
+    mapped: dict[str, pd.Timestamp | None] = {symbol: None for symbol in symbols}
+    candidates: dict[str, list[pd.Timestamp]] = {symbol: [] for symbol in symbols}
+    segments = _segments(text[:8000])
+    action_context = False
+    for segment in segments:
+        segment_symbols = [
+            symbol for symbol in _symbols_in_order(segment, archive_symbols) if symbol in mapped
+        ]
+        times = _timestamps_in_segment(segment)
+        has_action = action.search(segment) is not None
+        structured_row = action_context and bool(segment_symbols) and len(times) == 1
+        explicit_shared = has_action and bool(segment_symbols) and len(times) == 1
+        if structured_row or explicit_shared:
+            for symbol in segment_symbols:
+                candidates[symbol].append(times[0])
+        if has_action and not segment_symbols and not times:
+            action_context = True
+        elif not segment_symbols and not times:
+            action_context = False
+    for symbol, values in candidates.items():
+        unique = list(dict.fromkeys(values))
+        if len(unique) == 1:
+            mapped[symbol] = unique[0]
+    return mapped
 
 
 def _candidate_title(event_type: str, title: str) -> bool:
@@ -168,7 +275,7 @@ def parse_announcement_evidence(
     event_type: str,
     archive_symbols: set[str],
     *,
-    retrieved_at: str,
+    retrieved_at: str | None,
     raw_snapshot_path: str,
     raw_snapshot_sha256: str,
 ) -> list[AnnouncementEvidence]:
@@ -181,29 +288,44 @@ def parse_announcement_evidence(
     symbols = title_symbols or _symbols_in_order(body_text, archive_symbols)
     if not symbols:
         return []
-    published = pd.to_datetime(index_record.get("releaseDate"), unit="ms", utc=True)
-    times = _lead_event_times(body_text)
-    mapped: dict[str, pd.Timestamp | None]
-    if len(times) == 1:
-        mapped = {symbol: times[0] for symbol in symbols}
-    elif len(times) == len(symbols):
-        mapped = dict(zip(symbols, times, strict=True))
-    else:
-        mapped = {symbol: None for symbol in symbols}
+    release_ms = strict_millisecond_timestamp(index_record.get("releaseDate"), "releaseDate")
+    published = pd.to_datetime(release_ms, unit="ms", utc=True)
+    semantic_class = classify_article_semantics(title, body_text)
+    expected_class = (
+        "original_perpetual_launch" if event_type == "listing" else "delisting_or_settlement"
+    )
+    semantic_accepted = semantic_class == expected_class
+    mapped = (
+        _action_anchored_event_times(body_text, symbols, semantic_class, archive_symbols)
+        if semantic_accepted
+        else {symbol: None for symbol in symbols}
+    )
 
     code = require_canonical_text(index_record.get("code"), "article code")
     return [
         AnnouncementEvidence(
             event_type=event_type,
             symbol=symbol,
-            match_status="accepted",
-            match_basis="exact_canonical_symbol_or_exact_base_slash_usdt",
+            match_status=("accepted" if semantic_accepted else "rejected_semantic_class"),
+            match_basis=(
+                "positive_product_semantics_and_exact_symbol"
+                if semantic_accepted
+                else "exact_symbol_but_non_original_or_non_delisting_semantics"
+            ),
+            article_semantic_class=semantic_class,
+            semantic_evidence_status=(
+                "accepted_positive_semantic_evidence"
+                if semantic_accepted
+                else "rejected_not_applicable_event_semantics"
+            ),
             article_code=code,
             article_title=title,
             article_published_at=published.isoformat(),
             official_event_at=mapped[symbol].isoformat() if mapped[symbol] is not None else None,
             event_time_evidence_status=(
-                "exact_official_announcement_time" if mapped[symbol] is not None else "unresolved"
+                "action_symbol_time_anchored"
+                if mapped[symbol] is not None
+                else "unresolved"
             ),
             source_url=f"{ANNOUNCEMENT_PAGE}/{code}",
             retrieved_at=retrieved_at,
@@ -258,7 +380,7 @@ def acquire_announcement_corpus(
     """Acquire public structured listing/delisting articles with immutable raw evidence."""
     root = Path(raw_root)
     root.mkdir(parents=True, exist_ok=True)
-    retrieved = datetime.now(UTC).isoformat()
+    rebuild_started_at = datetime.now(UTC).isoformat()
     evidence: list[AnnouncementEvidence] = []
     audit_catalogs: list[dict[str, Any]] = []
     detail_seen: set[str] = set()
@@ -296,6 +418,13 @@ def acquire_announcement_corpus(
             checksum = hashlib.sha256(payload).hexdigest()
             raw_path = root / f"catalog_{catalog_id}_page_{page:03d}_{checksum[:16]}.json"
             _preserve_raw(raw_path, payload)
+            if not page_was_cached:
+                record_new_snapshot_provenance(
+                    raw_path,
+                    url=url,
+                    parser_version=ANNOUNCEMENT_PARSER_VERSION,
+                )
+            load_snapshot_provenance(raw_path, expected_url=url, expected_sha256=checksum)
             response = _load_official_json(payload, f"catalog {catalog_id} page {page}")
             catalogs = response.get("data", {}).get("catalogs")
             if not isinstance(catalogs, list) or len(catalogs) != 1:
@@ -337,6 +466,15 @@ def acquire_announcement_corpus(
             checksum = hashlib.sha256(payload).hexdigest()
             raw_path = root / f"article_{code}_{checksum[:16]}.json"
             _preserve_raw(raw_path, payload)
+            if not article_was_cached:
+                record_new_snapshot_provenance(
+                    raw_path,
+                    url=url,
+                    parser_version=ANNOUNCEMENT_PARSER_VERSION,
+                )
+            article_provenance = load_snapshot_provenance(
+                raw_path, expected_url=url, expected_sha256=checksum
+            )
             response = _load_official_json(payload, f"article {code}")
             evidence.extend(
                 parse_announcement_evidence(
@@ -344,7 +482,11 @@ def acquire_announcement_corpus(
                     article,
                     event_type,
                     archive_symbols,
-                    retrieved_at=retrieved,
+                    retrieved_at=(
+                        article_provenance["original_retrieval_timestamp"]
+                        if article_provenance is not None
+                        else None
+                    ),
                     raw_snapshot_path=str(raw_path.resolve()),
                     raw_snapshot_sha256=checksum,
                 )
@@ -372,10 +514,14 @@ def acquire_announcement_corpus(
     frame = pd.DataFrame.from_records(rows, columns=list(AnnouncementEvidence.__annotations__))
     # Multiple official articles for one symbol/event (for example a relisting) are
     # not silently collapsed into one contract identity.
-    duplicate = frame.duplicated(["event_type", "symbol"], keep=False)
-    frame.loc[duplicate, "match_status"] = "ambiguous_multiple_official_articles"
+    accepted = frame["match_status"].eq("accepted")
+    duplicate = accepted & frame.loc[accepted].duplicated(
+        ["event_type", "symbol"], keep=False
+    ).reindex(frame.index, fill_value=False)
+    frame.loc[duplicate, "match_status"] = "ambiguous_multiple_applicable_articles"
     return frame, {
-        "retrieved_at": retrieved,
+        "rebuild_started_at": rebuild_started_at,
+        "legacy_cached_retrieval_times_unresolved": int(frame["retrieved_at"].isna().sum()),
         "endpoint": ANNOUNCEMENT_API,
         "parser_version": ANNOUNCEMENT_PARSER_VERSION,
         "catalogs": audit_catalogs,

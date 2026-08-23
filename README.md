@@ -63,10 +63,10 @@ To prepare a scalable download manifest without downloading full history:
 .venv\Scripts\python scripts/prepare_full_manifest.py --config config/research_v0_1.yaml
 ```
 
-This consumes the newest lifecycle catalog and emits expected monthly 1H object keys to a
-collision-resistant, exclusively created plan filename. It refuses to create a plan while any
-USDT candidate remains quarantined. It is a planning artifact; missing objects must be logged, not
-filled. Use the exact printed plan path below.
+This consumes the newest content-bound lifecycle bundle and emits only monthly 1H ZIP object keys
+actually observed in the preserved, fully paginated archive index. It refuses to create a plan while
+any potentially in-scope lifecycle or classification blocker remains unresolved. The plan embeds the
+bundle identity, exact artifact hashes, config digest, readiness state, and its own content digest.
 
 The prepared full-data path is resumable and deliberately requires an execution switch:
 
@@ -91,7 +91,9 @@ download remains separately prohibited until the lifecycle/integrity gate is acc
   --attempt-manifest data/raw/manifests/full_download_attempts_<RUN_ID>.json
 ```
 
-The downloader accepts only the exact Binance USD-M monthly 1H key grammar, writes remote bytes to
+The downloader first re-verifies the exact plan schema, lifecycle bundle, artifact/config hashes,
+recomputed readiness, and observed approved object set. It then accepts only the exact Binance USD-M
+monthly 1H key grammar, writes remote bytes to
 an isolated temporary file, verifies the named checksum sidecar, and atomically installs with
 no-replace semantics. It writes successes, missing objects, and classified failures to an exclusive
 attempt manifest. Processing treats that manifest as untrusted: it reconstructs and confines every

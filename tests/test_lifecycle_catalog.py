@@ -90,7 +90,8 @@ def test_catalog_keeps_official_current_and_archive_boundaries_distinct() -> Non
     assert old["scope_classification_status"] == "unresolved"
     coverage = catalog_coverage(catalog)
     assert coverage["total_archive_discovered_symbols"] == 2
-    assert coverage["currently_quarantined"] == 1
+    assert coverage["currently_quarantined"] == 2
+    assert eth["onboard_start_discrepancy_status"] == "unresolved_material_discrepancy"
 
 
 def test_structured_announcement_maps_multiple_exact_symbols_and_times() -> None:

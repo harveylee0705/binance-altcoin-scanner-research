@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from alt_hot_scanner.identity import require_binance_token
+from alt_hot_scanner.utils.numeric import strict_millisecond_timestamp, strict_raw_integer
 
 KLINE_COLUMNS = [
     "open_time",
@@ -47,12 +48,13 @@ def normalize_kline_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     ]
     for column in numeric:
         frame[column] = pd.to_numeric(frame[column], errors="raise").astype("float64")
-    frame["trade_count"] = pd.to_numeric(frame["trade_count"], errors="raise").astype("int64")
+    frame["trade_count"] = frame["trade_count"].map(
+        lambda value: strict_raw_integer(value, "trade_count", minimum=0)
+    ).astype("int64")
     for column in ("open_time", "close_time"):
-        values = pd.to_numeric(frame[column], errors="raise").astype("int64")
-        # USD-M archive timestamps are milliseconds. This also rejects accidental microseconds.
-        if values.abs().max() >= 10**14:
-            raise ValueError(f"Unexpected non-millisecond timestamp in {column}")
+        values = frame[column].map(
+            lambda value, field=column: strict_millisecond_timestamp(value, field)
+        ).astype("int64")
         frame[column] = pd.to_datetime(values, unit="ms", utc=True)
     frame.insert(0, "symbol", symbol)
     frame = frame.drop(columns="ignore").sort_values("open_time").reset_index(drop=True)

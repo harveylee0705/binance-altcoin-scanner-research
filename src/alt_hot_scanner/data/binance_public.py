@@ -98,6 +98,7 @@ class ArchiveMonthObservation:
     returned_key_count: int
     unique_archive_count: int
     any_page_truncated: bool
+    observed_archive_object_keys: tuple[str, ...]
 
 
 class ArchiveAcquisitionError(RuntimeError):
@@ -801,7 +802,8 @@ def discover_archive_months(
     listing = list_archive_index(prefix, page_observer=page_observer)
     identities: dict[str, ArchiveObjectIdentity] = {}
     for returned_key in listing.keys:
-        object_key = returned_key.removesuffix(".CHECKSUM")
+        is_checksum = returned_key.endswith(".CHECKSUM")
+        object_key = returned_key.removesuffix(".CHECKSUM") if is_checksum else returned_key
         try:
             identity = validate_archive_object_key(object_key)
         except (TypeError, ValueError) as exc:
@@ -810,7 +812,8 @@ def discover_archive_months(
             ) from exc
         if identity.symbol != canonical_symbol:
             raise ValueError("Archive month listing returned a mismatched symbol")
-        identities[identity.object_key] = identity
+        if not is_checksum:
+            identities[identity.object_key] = identity
     if not identities:
         raise ValueError(f"No monthly 1H archives found for {canonical_symbol}")
     periods = sorted(identity.period for identity in identities.values())
@@ -829,7 +832,35 @@ def discover_archive_months(
         returned_key_count=listing.audit.returned_key_count,
         unique_archive_count=len(identities),
         any_page_truncated=listing.audit.any_page_truncated,
+        observed_archive_object_keys=tuple(sorted(identities)),
     )
+
+
+def observed_zip_keys_from_index_snapshots(
+    paths: list[str] | tuple[str, ...], symbol: str
+) -> tuple[str, ...]:
+    """Recover exact ZIP objects from preserved official index pages; sidecars do not count."""
+    canonical_symbol = require_binance_token(symbol, "archive symbol")
+    namespace_uri = "http://s3.amazonaws.com/doc/2006-03-01/"
+    keys: set[str] = set()
+    for raw_path in paths:
+        try:
+            root = ET.fromstring(Path(raw_path).read_bytes())
+        except (OSError, ET.ParseError) as exc:
+            raise ValueError(f"Cannot parse preserved archive index snapshot {raw_path}") from exc
+        if root.tag != f"{{{namespace_uri}}}ListBucketResult":
+            raise ValueError("Preserved archive index snapshot has an unexpected namespace")
+        for node in root.findall(f"{{{namespace_uri}}}Contents/{{{namespace_uri}}}Key"):
+            key = node.text
+            if not key or key.endswith(".CHECKSUM"):
+                continue
+            identity = validate_archive_object_key(key)
+            if identity.symbol != canonical_symbol:
+                raise ValueError("Preserved archive index snapshot contains a mismatched symbol")
+            keys.add(identity.object_key)
+    if not keys:
+        raise ValueError(f"No actual ZIP objects found in preserved index pages for {symbol}")
+    return tuple(sorted(keys))
 
 
 def fetch_exchange_info_snapshot(path: str | Path) -> dict:

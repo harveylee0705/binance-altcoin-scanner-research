@@ -1,5 +1,30 @@
 # Decision Log
 
+## 2026-08-23 — Pre-evaluation lifecycle age-anchor evidence policy
+
+Decision: a contract must never become eligible before it existed and traded on Binance Futures,
+and eligibility continues to require at least 30 calendar days of age. The eligibility-age anchor is
+now a separate lifecycle fact with an explicit basis. A reliable official source that positively
+establishes the exact original launch of the exact perpetual contract is recorded as
+`exact_official_trading_start_at` with basis `exact_official_original_launch`. When that evidence is
+unavailable, the earliest independently checksum-verified Binance USD-M Futures trade timestamp may
+be recorded as `first_observed_trade_at` and used with basis
+`first_observed_binance_futures_trade`. It must not be relabeled as an exact official listing time.
+Legacy contracts already known to be trading at research start require explicit official evidence
+that they existed by 2019-12-02 before receiving basis `legacy_pre_research_start_adjudicated`;
+otherwise the basis remains `unresolved`.
+
+Decision: the fixed 30-calendar-day rule operates on `eligibility_age_anchor_at`. A later observed
+trade boundary can conservatively exclude early history and that coverage loss must be reported. No
+earlier boundary may be inferred. Exact launch coverage, conservative observed-trade coverage,
+legacy adjudication, and unresolved anchors must be reported separately.
+
+Reason: a verified market trade proves the contract was live by that instant without asserting an
+unavailable exact launch time. This conservatively preserves the no-prelisting invariant while
+avoiding an unjustified requirement for perfect historical announcement coverage. This is an
+evidence-resolution policy recorded before scanner outcome inspection, not a scanner parameter
+change. No scanner performance, validation-period results, or final-holdout results were inspected.
+
 ## 2026-08-23 — Pre-evaluation correction: HOT is canonical D10 membership
 
 Decision: define `is_hot` solely as `hot_decile == 10`, retaining average-tie percentile ranks,

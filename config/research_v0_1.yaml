@@ -1,0 +1,76 @@
+version: "scanner-v0.1"
+timezone: "UTC"
+
+universe:
+  exchange: "Binance"
+  market: "USD-M"
+  quote_asset: "USDT"
+  margin_asset: "USDT"
+  contract_type: "PERPETUAL"
+  exclude_symbols: ["BTCUSDT"]
+  benchmark_symbol: "BTCUSDT"
+  include_eth: true
+  stablecoin_underlyings:
+    ["USDT", "USDC", "BUSD", "TUSD", "FDUSD", "USDP", "DAI", "UST", "USTC"]
+  minimum_age_calendar_days: 30
+  stop_new_events_after_delisting_announcement: true
+  hard_liquidity_threshold: null
+
+data:
+  start: "2020-01-01T00:00:00Z"
+  latest_policy: "latest_fully_completed_available_data"
+  canonical_interval: "1h"
+  scanner_interval: "4h"
+  four_hour_utc_open_hours: [0, 4, 8, 12, 16, 20]
+  missing_bar_policy: "reject_incomplete_4h_bar_do_not_fill"
+  raw_immutable: true
+  archive_base_url: "https://data.binance.vision/data/futures/um"
+  archive_index_url: "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
+  exchange_info_url: "https://fapi.binance.com/fapi/v1/exchangeInfo"
+  funding_rate_url: "https://fapi.binance.com/fapi/v1/fundingRate"
+
+features:
+  return_windows_4h: {rs_1d: 6, rs_3d: 18, rs_7d: 42}
+  volume_4h_baseline_bars: 30
+  volume_24h_sum_bars: 6
+  volume_24h_baseline_observations: 20
+  liquidity_30d_observations_4h: 180
+  previous_high_bars: 120
+  atr_period: 14
+  atr_method: "wilder_seeded_sma_then_recursive"
+  percentile_scale: [0.0, 1.0]
+  percentile_tie_method: "average"
+  hot_score_weights:
+    rs_1d_pct: 0.2
+    rs_3d_pct: 0.2
+    rs_7d_pct: 0.2
+    vol_exp_4h_pct: 0.2
+    vol_exp_24h_pct: 0.2
+  hot_percentile_threshold: 0.9
+
+stages:
+  approaching_distance_atr: [0.0, 0.75]
+  early_trend_lookback_bars: 3
+  extended_distance_atr: 2.0
+
+outcomes:
+  forward_windows_4h: {fwd_1d: 6, fwd_3d: 18, fwd_7d: 42}
+  excursion_windows_4h: {mfe_mae_3d: 18, mfe_mae_7d: 42}
+  barrier_windows_4h: {barrier_3d: 18, barrier_7d: 42}
+  upper_barrier_atr: 2.0
+  lower_barrier_atr: 1.0
+  same_bar_barrier_policy: "ambiguous"
+
+splits:
+  development: {start: "2020-01-01T00:00:00Z", end: "2023-06-30T23:59:59.999999Z"}
+  validation: {start: "2023-07-01T00:00:00Z", end: "2024-12-31T23:59:59.999999Z"}
+  final_holdout: {start: "2025-01-01T00:00:00Z", end: null}
+  default_allowed_for_analysis: ["development"]
+
+vertical_slice:
+  symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "SOLUSDT"]
+  archive_months: ["2023-03", "2023-04", "2023-05", "2023-06"]
+  analysis_start: "2023-05-15T00:00:00Z"
+  analysis_end: "2023-06-20T00:00:00Z"
+  permitted_split: "development"
+

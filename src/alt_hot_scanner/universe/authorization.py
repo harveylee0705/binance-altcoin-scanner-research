@@ -3,14 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from alt_hot_scanner.data.binance_public import (
-    parse_earliest_trade_timestamp,
     validate_archive_object_key,
+    verify_first_observed_trade_record,
 )
 from alt_hot_scanner.universe.contracts import filter_instrument_scope
 from alt_hot_scanner.universe.lifecycle import CATALOG_SCHEMA_VERSION
@@ -219,6 +220,9 @@ def _verify_catalog_evidence_consistency(
     trade_by_symbol = {row.get("symbol"): row for row in first_trades}
     if len(trade_by_symbol) != len(first_trades):
         raise ValueError("First-observed-trade evidence contains duplicate identities")
+    if first_trades:
+        with ProcessPoolExecutor(max_workers=min(8, len(first_trades))) as executor:
+            list(executor.map(verify_first_observed_trade_record, first_trades))
     delisting_catalogs = [
         item
         for item in announcement_audit.get("catalogs", [])
@@ -287,15 +291,8 @@ def _verify_catalog_evidence_consistency(
                 "first_observed_trade_at"
             ):
                 raise ValueError("Catalog observed-trade anchor lacks exact primitive evidence")
-            raw_path = Path(trade.get("raw_path", ""))
-            if sha256_path(raw_path) != trade.get("computed_sha256") or trade.get(
-                "computed_sha256"
-            ) != trade.get("published_sha256"):
-                raise ValueError("First-observed-trade raw checksum evidence is invalid")
-            if parse_earliest_trade_timestamp(raw_path).isoformat() != trade.get(
-                "earliest_trade_timestamp"
-            ):
-                raise ValueError("First-observed-trade timestamp disagrees with raw ZIP")
+            if trade.get("computed_sha256") != trade.get("published_sha256"):
+                raise ValueError("First-observed-trade checksum evidence is inconsistent")
         basis = row.get("eligibility_age_anchor_basis")
         if basis == "exact_official_original_launch" and row.get(
             "eligibility_age_anchor_at"

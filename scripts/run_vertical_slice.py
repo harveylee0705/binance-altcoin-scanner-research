@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -11,23 +10,23 @@ from alt_hot_scanner.data.aggregate import aggregate_1h_to_4h
 from alt_hot_scanner.data.binance_public import (
     collision_resistant_run_id,
     download_verified_archive,
-    fetch_exchange_info_snapshot,
     monthly_kline_key,
     write_download_manifest,
     write_json_exclusive,
 )
 from alt_hot_scanner.data.normalize import read_kline_zip
 from alt_hot_scanner.pipeline import build_vertical_slice
-from alt_hot_scanner.universe.contracts import (
-    filter_instrument_scope,
-    records_from_exchange_info,
-)
+from alt_hot_scanner.universe.contracts import filter_instrument_scope
 from alt_hot_scanner.utils.config import load_config
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the development-only Scanner v0.1 slice")
     parser.add_argument("--config", default="config/research_v0_1.yaml")
+    parser.add_argument(
+        "--catalog",
+        help="Lifecycle catalog JSON; defaults to the most recently created local catalog",
+    )
     return parser.parse_args()
 
 
@@ -81,9 +80,17 @@ def main() -> None:
     write_json_exclusive(
         raw_root / "manifests" / f"slice_quality_{run_id}.json", quality_records
     )
-    snapshot_path = raw_root / "metadata" / f"exchange_info_{run_id}.json"
-    exchange_info = fetch_exchange_info_snapshot(snapshot_path)
-    contracts = records_from_exchange_info(exchange_info, pd.Timestamp(datetime.now(UTC)))
+    if args.catalog:
+        catalog_path = Path(args.catalog).resolve()
+    else:
+        candidates = sorted((root / "reports" / "lifecycle").glob("*/lifecycle_catalog.json"))
+        if not candidates:
+            raise RuntimeError("Build the lifecycle catalog before running the engineering slice")
+        catalog_path = candidates[-1]
+    contracts = pd.DataFrame(json.loads(catalog_path.read_text(encoding="utf-8")))
+    contracts["underlying_subtype"] = contracts["underlying_subtype"].map(
+        lambda value: tuple(json.loads(value)) if isinstance(value, str) else value
+    )
     contracts = filter_instrument_scope(contracts, config["universe"]["stablecoin_underlyings"])
     selected_contracts = contracts.loc[contracts["symbol"].isin(slice_config["symbols"])].copy()
     missing_metadata = set(slice_config["symbols"]) - set(selected_contracts["symbol"])
@@ -125,7 +132,7 @@ def main() -> None:
         "complete_hot_score_rows": int(output["hot_score"].notna().sum()),
         "complete_3d_label_rows": int(output["fwd_return_3d"].notna().sum()),
         "output_path": str(output_path),
-        "metadata_snapshot": str(snapshot_path),
+        "lifecycle_catalog": str(catalog_path),
     }
     report_path = root / "reports" / f"vertical_slice_audit_{run_id}.json"
     write_json_exclusive(report_path, summary)

@@ -26,10 +26,10 @@ research sequencing, pre-registered pass criteria, and limitations are in
 - Canonical OHLCV: Binance Public Data monthly USD-M archive, including `.CHECKSUM` sidecars.
 - Current contract metadata: `GET /fapi/v1/exchangeInfo` (useful fields include `onboardDate`,
   `deliveryDate`, `contractType`, assets, and status).
-- Historical symbol discovery: the public archive object index, not the current exchange list.
+- Historical symbol discovery: the fully paginated public archive object index, not the current exchange list.
 - Funding: `GET /fapi/v1/fundingRate`, stored for future work but excluded from v0.1 features.
-- Delisting announcements: official Binance announcement pages require a separately versioned,
-  auditable reconstruction; no timestamp is inferred when unavailable.
+- Lifecycle announcements: structured official Binance CMS responses are captured in a separately
+  versioned, auditable reconstruction; no timestamp is inferred when unavailable.
 
 The archive's first valid kline is an observed data boundary, not proof of the public announcement
 time. Current `exchangeInfo` is not a historical point-in-time membership source. See
@@ -63,11 +63,22 @@ To prepare a scalable download manifest without downloading full history:
 .venv\Scripts\python scripts/prepare_full_manifest.py --config config/research_v0_1.yaml
 ```
 
-This discovers archived symbols (including delisted ones) from the object index and emits expected
-monthly 1H object keys to a collision-resistant, exclusively created plan filename. It is a planning
-artifact; missing objects must be logged, not filled. Use the exact printed plan path below.
+This consumes the newest lifecycle catalog and emits expected monthly 1H object keys to a
+collision-resistant, exclusively created plan filename. It refuses to create a plan while any
+USDT candidate remains quarantined. It is a planning artifact; missing objects must be logged, not
+filled. Use the exact printed plan path below.
 
 The prepared full-data path is resumable and deliberately requires an execution switch:
+
+Before preparing or executing full history, build and review the lifecycle catalog:
+
+```powershell
+.venv\Scripts\python scripts/build_lifecycle_catalog.py
+```
+
+The command is metadata-only and writes an auditable catalog, raw-source checksums, coverage report,
+and unresolved queue. See [`docs/LIFECYCLE_CATALOG.md`](docs/LIFECYCLE_CATALOG.md). Full-history
+download remains separately prohibited until the lifecycle/integrity gate is accepted.
 
 ```powershell
 # Dry-run validation only (safe default)

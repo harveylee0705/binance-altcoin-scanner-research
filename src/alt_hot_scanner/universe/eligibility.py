@@ -13,7 +13,12 @@ def apply_point_in_time_eligibility(
     timestamp_col: str = "close_time",
 ) -> pd.DataFrame:
     """Join contract evidence and compute scanner eligibility at each completed timestamp."""
-    required = {"symbol", "onboard_timestamp", "delisting_announcement_timestamp"}
+    required = {
+        "symbol",
+        "official_trading_start_at",
+        "delisting_announcement_published_at",
+        "scope_classification_status",
+    }
     missing = required - set(contracts.columns)
     if missing:
         raise ValueError(f"Contract metadata is missing {sorted(missing)}")
@@ -30,16 +35,21 @@ def apply_point_in_time_eligibility(
 
     result = bars.merge(contracts, on="symbol", how="left", validate="many_to_one")
     signal_time = pd.to_datetime(result[timestamp_col], utc=True)
-    onboard = pd.to_datetime(result["onboard_timestamp"], utc=True)
-    age = signal_time - onboard
+    trading_start = pd.to_datetime(result["official_trading_start_at"], utc=True)
+    age = signal_time - trading_start
     result["contract_age_days"] = age.dt.total_seconds() / 86_400
-    has_listing_evidence = onboard.notna()
+    has_listing_evidence = trading_start.notna()
     old_enough = age >= pd.Timedelta(days=minimum_age_days)
-    announced = pd.to_datetime(result["delisting_announcement_timestamp"], utc=True)
+    announced = pd.to_datetime(result["delisting_announcement_published_at"], utc=True)
     before_announcement = announced.isna() | signal_time.lt(announced)
     has_market_data = result["close"].notna()
+    scope_resolved = result["scope_classification_status"].ne("unresolved")
     result["is_eligible"] = (
-        has_listing_evidence & old_enough & before_announcement & has_market_data
+        scope_resolved
+        & has_listing_evidence
+        & old_enough
+        & before_announcement
+        & has_market_data
     )
     result["is_eth"] = result["symbol"].eq("ETHUSDT")
     result["is_benchmark"] = result["symbol"].eq("BTCUSDT")

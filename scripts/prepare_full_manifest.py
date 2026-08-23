@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -8,10 +9,10 @@ import pandas as pd
 
 from alt_hot_scanner.data.binance_public import (
     collision_resistant_run_id,
-    list_archive_symbols,
     monthly_kline_key,
     write_json_exclusive,
 )
+from alt_hot_scanner.universe.contracts import filter_instrument_scope
 from alt_hot_scanner.utils.config import load_config
 
 
@@ -27,6 +28,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare, but do not execute, a full archive plan")
     parser.add_argument("--config", default="config/research_v0_1.yaml")
     parser.add_argument("--end-month", help="YYYY-MM; default is the current fully ended month")
+    parser.add_argument(
+        "--catalog",
+        help="Approved lifecycle catalog JSON; defaults to the newest local catalog",
+    )
     return parser.parse_args()
 
 
@@ -34,7 +39,32 @@ def main() -> None:
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / args.config)
-    symbols = [symbol for symbol in list_archive_symbols() if symbol.endswith("USDT")]
+    if args.catalog:
+        catalog_path = Path(args.catalog).resolve()
+    else:
+        candidates = sorted((root / "reports" / "lifecycle").glob("*/lifecycle_catalog.json"))
+        if not candidates:
+            raise RuntimeError("Build and approve a lifecycle catalog before preparing full history")
+        catalog_path = candidates[-1]
+    coverage_path = catalog_path.with_name("coverage.json")
+    if not coverage_path.exists():
+        raise RuntimeError("Lifecycle coverage report is required beside the catalog")
+    lifecycle_coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+    if lifecycle_coverage.get("currently_quarantined") != 0:
+        raise RuntimeError(
+            "Lifecycle/integrity gate is incomplete; do not prepare a full-history plan"
+        )
+    catalog = pd.DataFrame(json.loads(catalog_path.read_text(encoding="utf-8")))
+    catalog["underlying_subtype"] = catalog["underlying_subtype"].map(
+        lambda value: tuple(json.loads(value)) if isinstance(value, str) else value
+    )
+    scoped = filter_instrument_scope(
+        catalog, config["universe"]["stablecoin_underlyings"]
+    )
+    ready = scoped.loc[scoped["official_trading_start_at"].notna()]
+    symbols = sorted(ready["symbol"].tolist())
+    if not symbols:
+        raise RuntimeError("No lifecycle-approved symbols are ready for acquisition planning")
     start = pd.Timestamp(config["data"]["start"]).tz_localize(None).to_period("M")
     now = pd.Timestamp.now(tz="UTC")
     end = pd.Period(args.end_month, freq="M") if args.end_month else last_completed_month(now)
@@ -43,9 +73,10 @@ def main() -> None:
         "created_at": datetime.now(UTC).isoformat(),
         "purpose": "download_plan_only_no_market_data_downloaded",
         "source": config["data"]["archive_index_url"],
+        "lifecycle_catalog": str(catalog_path),
         "warning": (
-            "Archive discovery includes delisted objects but suffix alone is not final instrument "
-            "classification; join authoritative metadata and quarantine unresolved symbols."
+            "Plan includes only lifecycle-catalog rows with resolved frozen scope and an exact "
+            "official trading start; full download still requires separate authorization."
         ),
         "symbols_discovered": len(symbols),
         "months": months,

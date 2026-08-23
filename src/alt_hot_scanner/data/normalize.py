@@ -101,13 +101,36 @@ def validate_normalized_1h(frame: pd.DataFrame) -> None:
     expected_close = frame["open_time"] + pd.Timedelta(hours=1) - pd.Timedelta(milliseconds=1)
     if not frame["close_time"].eq(expected_close).all():
         raise ValueError("close_time must equal open_time + 1 hour - 1 millisecond")
+    numeric_fields = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "base_volume",
+        "quote_volume",
+        "taker_buy_base_volume",
+        "taker_buy_quote_volume",
+        "trade_count",
+    ]
+    numeric = frame[numeric_fields]
+    try:
+        finite = np.isfinite(numeric.to_numpy(dtype="float64"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Malformed numeric value in normalized market data") from exc
+    if not finite.all():
+        raise ValueError("Non-finite normalized market value")
     if (frame[["open", "high", "low", "close"]] <= 0).any().any():
         raise ValueError("OHLC prices must be positive")
     high_floor = frame[["open", "low", "close"]].max(axis=1)
     low_ceiling = frame[["open", "high", "close"]].min(axis=1)
     if (frame["high"] < high_floor).any() or (frame["low"] > low_ceiling).any():
         raise ValueError("Invalid OHLC relationship")
-    if (frame[["base_volume", "quote_volume", "trade_count"]] < 0).any().any():
+    nonnegative = [
+        "base_volume",
+        "quote_volume",
+        "taker_buy_base_volume",
+        "taker_buy_quote_volume",
+        "trade_count",
+    ]
+    if (frame[nonnegative] < 0).any().any():
         raise ValueError("Volumes and trade_count must be nonnegative")
-    if not np.isfinite(frame[["open", "high", "low", "close", "quote_volume"]]).all().all():
-        raise ValueError("Non-finite required market value")

@@ -1,5 +1,54 @@
 # Decision Log
 
+## 2026-08-23 — Pre-evaluation correction: HOT is canonical D10 membership
+
+Decision: define `is_hot` solely as `hot_decile == 10`, retaining average-tie percentile ranks,
+equal HotScore weights, and D1–D10 as the primary analysis. Ties receive their average-rank decile;
+there is no forced HOT member in a small cross-section and a boundary tie may make D10 empty or
+larger than exactly ten percent.
+
+Reason: the independent `hot_score_pct >= 0.9` translation selected ranks at both 0.9 and 1.0, so
+ten uniquely ranked contracts produced two HOT members. This is a pre-evaluation implementation/spec
+translation correction; no scanner outcomes were inspected and no research parameter changed.
+
+## 2026-08-23 — Pre-evaluation correction: complete archive-index pagination
+
+Decision: consume every S3 `ListObjectsV2` page through explicit continuation tokens, validate the
+XML and canonical prefix/key grammar, reject missing/repeated/inconsistent tokens, and retain page,
+prefix, uniqueness, and truncation audit counts.
+
+Reason: a single response is not proof of complete historical-symbol discovery. This is a
+pre-evaluation acquisition-integrity correction made without downloading full OHLCV or inspecting
+scanner outcomes.
+
+## 2026-08-23 — Pre-evaluation correction: enforce normalized OHLCV structure
+
+Decision: normalized 1H validation rejects non-finite retained numeric fields, non-positive OHLC,
+impossible high/low relationships, negative base/quote/taker volumes, and negative trade counts.
+Internally consistent extreme observations remain valid.
+
+Reason: implementation did not fully enforce the already documented hard-error contract. This is a
+pre-evaluation specification-enforcement correction, not a market-data cleaning or strategy change.
+
+## 2026-08-23 — Historical lifecycle evidence hierarchy and quarantine gate
+
+Decision: version the catalog as `binance-usdm-lifecycle-v1`; keep exact official announcement
+publication/trading timestamps, current-snapshot onboard/delivery/status, archive-observed month
+bounds, and valid-kline bounds as distinct nullable evidence. Acquire official structured Binance CMS
+catalog/detail responses immutably with checksums. Accept only exact symbol matches; mark repeated,
+ambiguous, renamed, migrated, or otherwise non-unique identity evidence unresolved for review.
+
+Decision: scope admission requires explicit per-contract crypto, stablecoin, and leveraged-token
+classification evidence. Archive-only candidates remain quarantined when any required classification
+is unknown. The legacy static stablecoin list is not admission evidence, and ticker suffixes remain
+prohibited as leveraged-token evidence. Eligibility requires an exact official trading start, applies
+the fixed 30-day age rule, and stops strictly at an exact known announcement publication time; current
+status never back-filters history.
+
+Reason: archive data proves observation, while current metadata and announcement evidence answer
+different questions. Keeping these layers separate prevents survivorship and look-ahead leakage.
+This lifecycle work occurred before scanner evaluation and did not inspect any score outcomes.
+
 ## 2026-08-23 — Freeze Scanner v0.1 before outcome inspection
 
 Decision: encode the supplied universe, equal weights, windows, top-decile operational label,

@@ -84,6 +84,60 @@ def test_percentiles_and_hot_score_are_equal_weighted() -> None:
     assert pd.isna(result.loc[result["symbol"].eq("BTCUSDT"), "hot_score"]).all()
 
 
+def _uniquely_ranked_scanner_input(altcoin_count: int) -> pd.DataFrame:
+    time = pd.Timestamp("2023-01-01T00:00:00Z")
+    values = np.arange(1, altcoin_count + 1, dtype=float)
+    symbols = [f"ALT{index:03d}USDT" for index in range(altcoin_count)] + ["BTCUSDT"]
+    frame = pd.DataFrame(
+        {
+            "symbol": symbols,
+            "open_time": [time] * len(symbols),
+            "is_eligible": [True] * len(symbols),
+            "is_benchmark": [False] * altcoin_count + [True],
+        }
+    )
+    for column in [
+        "return_1d",
+        "return_3d",
+        "return_7d",
+        "vol_exp_4h_raw",
+        "vol_exp_24h_raw",
+        "median_30d_daily_quote_volume",
+    ]:
+        frame[column] = np.append(values, 1_000_000.0)
+    return frame
+
+
+@pytest.mark.parametrize(("altcoin_count", "expected_hot"), [(10, 1), (20, 2)])
+def test_hot_is_exactly_d10_for_unique_cross_sections(
+    altcoin_count: int, expected_hot: int
+) -> None:
+    result = add_cross_sectional_scanner(_uniquely_ranked_scanner_input(altcoin_count))
+    altcoins = result.loc[~result["is_benchmark"]]
+    assert int(altcoins["is_hot"].sum()) == expected_hot
+    assert result["is_hot"].eq(result["hot_decile"].eq(10)).all()
+    assert not bool(result.loc[result["symbol"].eq("BTCUSDT"), "is_hot"].iloc[0])
+
+
+def test_average_rank_tie_at_decile_boundary_is_deterministic() -> None:
+    frame = _uniquely_ranked_scanner_input(10)
+    # Tie the highest two rows in every score component. Average percentile is
+    # 0.95, so both deterministically map to D10 under the frozen rule.
+    component_sources = [
+        "return_1d",
+        "return_3d",
+        "return_7d",
+        "vol_exp_4h_raw",
+        "vol_exp_24h_raw",
+    ]
+    frame.loc[8:9, component_sources] = 10.0
+    result = add_cross_sectional_scanner(frame)
+    tied = result.loc[result["symbol"].isin(["ALT008USDT", "ALT009USDT"])]
+    assert tied["hot_score_pct"].eq(0.95).all()
+    assert tied["hot_decile"].eq(10).all()
+    assert tied["is_hot"].all()
+
+
 def test_hot_episode_created_only_on_state_entry() -> None:
     times = pd.date_range("2023-01-01", periods=7, freq="4h", tz="UTC")
     observations = pd.DataFrame(

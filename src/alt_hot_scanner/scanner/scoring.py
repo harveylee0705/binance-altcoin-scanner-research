@@ -45,7 +45,8 @@ def add_cross_sectional_scanner(features: pd.DataFrame) -> pd.DataFrame:
     result.loc[ranked, "hot_decile"] = (
         np.ceil(result.loc[ranked, "hot_score_pct"] * 10).clip(1, 10).astype(int)
     )
-    result["is_hot"] = (
-        result["is_eligible"] & ~result["is_benchmark"] & result["hot_score_pct"].ge(0.9)
-    )
+    # HOT is a name for membership in the primary D10 bucket, not a second
+    # independently thresholded selection rule.  With average percentile ranks,
+    # ties may make D10 empty or contain more than exactly 10% of a cross-section.
+    result["is_hot"] = result["hot_decile"].eq(10).fillna(False)
     return result.sort_values(["open_time", "symbol"]).reset_index(drop=True)

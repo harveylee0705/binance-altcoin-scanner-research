@@ -13,6 +13,7 @@ from alt_hot_scanner.utils.config import load_config
 
 
 def _metadata(symbol: str, **overrides: object) -> dict:
+    stablecoin = symbol == "USDCUSDT"
     row = {
         "symbol": symbol,
         "base_asset": symbol.removesuffix("USDT"),
@@ -22,11 +23,16 @@ def _metadata(symbol: str, **overrides: object) -> dict:
         "market_family": "USDM",
         "product_family": "FUTURES",
         "underlying_type": "COIN",
-        "underlying_subtype": ("synthetic-crypto",),
+        "underlying_subtype": ("Stablecoin",) if stablecoin else ("synthetic-crypto",),
+        "is_crypto_underlying": True,
+        "is_stablecoin_underlying": stablecoin,
         "is_leveraged_token": False,
-        "classification_provenance": "synthetic_test_fixture",
-        "onboard_timestamp": pd.Timestamp("2020-01-01T00:00:00Z"),
-        "delisting_announcement_timestamp": pd.NaT,
+        "is_benchmark_btc": symbol == "BTCUSDT",
+        "is_eth": symbol == "ETHUSDT",
+        "scope_classification_status": "resolved_synthetic_fixture",
+        "scope_classification_provenance": "synthetic_test_fixture",
+        "official_trading_start_at": pd.Timestamp("2020-01-01T00:00:00Z"),
+        "delisting_announcement_published_at": pd.NaT,
     }
     row.update(overrides)
     return row
@@ -64,8 +70,8 @@ def test_pipeline_fails_closed_on_unresolved_classification() -> None:
     contracts = pd.DataFrame(
         {
             "symbol": ["BTCUSDT"],
-            "onboard_timestamp": [pd.Timestamp("2020-01-01T00:00:00Z")],
-            "delisting_announcement_timestamp": [pd.NaT],
+            "official_trading_start_at": [pd.Timestamp("2020-01-01T00:00:00Z")],
+            "delisting_announcement_published_at": [pd.NaT],
         }
     )
     with pytest.raises(ValueError, match="classification is unresolved"):
@@ -90,7 +96,7 @@ def test_exchange_info_missing_or_malformed_subtype_fails_closed(subtype: object
     scoped = filter_instrument_scope(normalized, config["universe"]["stablecoin_underlyings"])
     assert scoped.empty
     assert pd.isna(normalized.iloc[0]["is_leveraged_token"])
-    assert pd.isna(normalized.iloc[0]["classification_provenance"])
+    assert pd.isna(normalized.iloc[0]["scope_classification_provenance"])
 
 
 def test_exchange_info_missing_identity_field_is_quarantined_not_inferred() -> None:
@@ -115,8 +121,8 @@ def test_exchange_info_missing_identity_field_is_quarantined_not_inferred() -> N
         ("symbol", None),
         ("base_asset", ""),
         ("base_asset", None),
-        ("classification_provenance", ""),
-        ("classification_provenance", None),
+        ("scope_classification_provenance", ""),
+        ("scope_classification_provenance", None),
     ],
 )
 def test_blank_required_classification_values_are_excluded(field: str, value: object) -> None:
@@ -140,7 +146,7 @@ def test_blank_required_classification_values_are_excluded(field: str, value: ob
         ("market_family", "USD-M"),
         ("product_family", "futures"),
         ("underlying_type", "coin"),
-        ("classification_provenance", " synthetic_test_fixture"),
+        ("scope_classification_provenance", " synthetic_test_fixture"),
     ],
 )
 def test_noncanonical_identity_cannot_bypass_stablecoin_exclusion(
@@ -169,6 +175,37 @@ def test_wrong_typed_leveraged_token_evidence_is_quarantined(value: object) -> N
     assert scoped.empty
 
 
+def test_stablecoin_exclusion_uses_explicit_evidence_not_static_ticker_list() -> None:
+    config = load_config("config/research_v0_1.yaml")
+    unlisted_stablecoin = _metadata(
+        "NEWSTABLEUSDT",
+        is_stablecoin_underlying=True,
+        underlying_subtype=("Stablecoin",),
+    )
+    scoped = filter_instrument_scope(
+        pd.DataFrame([unlisted_stablecoin]), config["universe"]["stablecoin_underlyings"]
+    )
+    assert "NEWSTABLE" not in config["universe"]["stablecoin_underlyings"]
+    assert scoped.empty
+
+
+def test_archive_only_unknown_classification_fails_closed() -> None:
+    config = load_config("config/research_v0_1.yaml")
+    unknown = _metadata(
+        "OLDUSDT",
+        underlying_type=None,
+        underlying_subtype=None,
+        is_crypto_underlying=None,
+        is_stablecoin_underlying=None,
+        is_leveraged_token=None,
+        scope_classification_status="unresolved",
+        scope_classification_provenance="archive_observation_only",
+    )
+    assert filter_instrument_scope(
+        pd.DataFrame([unknown]), config["universe"]["stablecoin_underlyings"]
+    ).empty
+
+
 def test_padded_exchange_info_identity_is_quarantined_before_classification() -> None:
     config = load_config("config/research_v0_1.yaml")
     normalized = records_from_exchange_info(
@@ -189,7 +226,7 @@ def test_padded_exchange_info_identity_is_quarantined_before_classification() ->
     assert filter_instrument_scope(
         normalized, config["universe"]["stablecoin_underlyings"]
     ).empty
-    assert pd.isna(normalized.iloc[0]["classification_provenance"])
+    assert pd.isna(normalized.iloc[0]["scope_classification_provenance"])
 
 
 def test_symbol_must_match_canonical_base_and_quote_identity() -> None:

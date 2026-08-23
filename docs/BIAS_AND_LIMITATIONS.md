@@ -1,6 +1,6 @@
 # Bias, Data Quality, and Limitations
 
-## Known blocking data-source limitation
+## Historical lifecycle evidence
 
 Binance's current `exchangeInfo` endpoint describes current/retained symbol metadata; it is **not** a
 historical snapshot service. Using its current symbols alone would omit some delisted contracts and
@@ -9,17 +9,23 @@ official public archive object index, then joins separately captured metadata.
 
 The archive reliably establishes that data exists and provides first/last valid observations. It
 does not, by itself, prove the exact futures listing announcement time or the time a delisting became
-public. Historical official announcement timestamps are not exposed by a documented bulk market-
-data endpoint. Until an auditable official announcement corpus is reconstructed:
+public. Binance does expose a publicly accessible structured CMS catalog/detail mechanism used by
+its announcement pages. The lifecycle builder captures catalog 48 (New Cryptocurrency Listing) and
+catalog 161 (Delisting), stores raw JSON responses immutably with SHA-256, and conservatively matches
+exact canonical symbols. This is not part of the documented Futures market-data API, so its coverage
+and reproducibility are audited on every run.
+
+Where exact evidence is unavailable:
 
 - retain delisted archives and last valid/trading timestamps;
-- never fabricate `delisting_announcement_timestamp`;
+- never fabricate `delisting_announcement_published_at`;
 - set that field null with provenance;
-- disclose that new events between public announcement and last trading may remain eligible;
-- keep the eligibility interface able to enforce the timestamp when later supplied.
+- fail closed for missing verified trading starts;
+- permit a null delisting announcement only as an explicitly disclosed unresolved limitation.
 
-This limitation does not invalidate the engineering slice, but full historical inference must report
-its possible bias and ideally complete the announcement catalog before scanner evaluation.
+Search engines and third-party pages may locate an official article but never become the stored
+authority. Multiple official articles for one symbol/event are marked ambiguous instead of silently
+collapsed; this is also the relisting/reused-symbol safeguard.
 
 ## Leakage controls
 
@@ -53,10 +59,12 @@ horizon, and a later HOT row after a gap starts a new episode.
 
 ## Listing and delisting boundaries
 
-Official `onboardDate` is preferred for eligibility. First valid archived data is a quality field and
-fallback candidate requiring an explicit provenance flag; it must not silently replace known listing
-metadata. The 30-day minimum age is fixed and does not change based on outcomes. `deliveryDate` may be
-a far-future sentinel for active perpetuals and must not be interpreted as an actual delisting.
+Exact `official_trading_start_at` from accepted official announcement evidence is the eligibility
+boundary. Current `exchangeInfo.onboardDate` is retained separately and discrepancies are visible;
+it is not silently substituted for an unresolved official start. Archive bounds and first valid data
+are observed market-data evidence only. The 30-day minimum age is fixed and does not change based on
+outcomes. `deliveryDate` may be a far-future sentinel for active perpetuals and must not be interpreted
+as an actual delisting. Current active/delisted status never removes historical rows.
 
 ## Contract classification
 
@@ -65,7 +73,9 @@ and `PERPETUAL`, exclude stablecoin and leveraged-token underlyings, and reject 
 products based on captured metadata. Historical archive symbols missing authoritative classification
 remain quarantined rather than guessed into the universe.
 
-The reusable pipeline enforces this classification centrally. Leveraged-token status comes from
+The reusable pipeline enforces this classification centrally. Stablecoin admission depends on the
+captured per-contract subtype evidence, not whether a base appears in the legacy configuration list.
+Leveraged-token status comes from
 explicit metadata/provenance; suffix matching is prohibited because it misclassifies legitimate
 assets such as JUP and SYRUP.
 Missing/null/empty/malformed underlying-subtype evidence or blank identity/provenance fields are

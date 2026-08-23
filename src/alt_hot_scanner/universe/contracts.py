@@ -25,20 +25,28 @@ class ContractRecord:
     product_family: str | None
     underlying_type: str | None
     underlying_subtype: tuple[str, ...] | None
+    is_crypto_underlying: bool | None
+    is_stablecoin_underlying: bool | None
     is_leveraged_token: bool | None
-    classification_provenance: str | None
-    onboard_timestamp: pd.Timestamp | None
-    first_valid_timestamp: pd.Timestamp | None = None
-    delisting_announcement_timestamp: pd.Timestamp | None = None
-    last_trading_timestamp: pd.Timestamp | None = None
-    delivery_timestamp: pd.Timestamp | None = None
-    status: str | None = None
+    is_benchmark_btc: bool | None
+    is_eth: bool | None
+    scope_classification_status: str
+    scope_classification_provenance: str | None
+    exchange_info_onboard_at: pd.Timestamp | None
+    exchange_info_delivery_at: pd.Timestamp | None = None
+    latest_known_status: str | None = None
     metadata_acquired_at: pd.Timestamp | None = None
     metadata_source: str = "unknown"
+    metadata_raw_snapshot_path: str | None = None
+    metadata_raw_snapshot_sha256: str | None = None
 
 
 def records_from_exchange_info(
-    payload: dict, acquired_at: pd.Timestamp | None = None
+    payload: dict,
+    acquired_at: pd.Timestamp | None = None,
+    *,
+    raw_snapshot_path: str | None = None,
+    raw_snapshot_sha256: str | None = None,
 ) -> pd.DataFrame:
     """Normalize current exchangeInfo while retaining its current-snapshot provenance."""
     acquired = acquired_at or pd.Timestamp(datetime.now(UTC))
@@ -66,6 +74,11 @@ def records_from_exchange_info(
             underlying_type = item.get("underlyingType")
             underlying_subtype = None
             classification_fields_valid = False
+        normalized_subtypes = (
+            {subtype.upper() for subtype in underlying_subtype}
+            if classification_fields_valid and underlying_subtype is not None
+            else set()
+        )
         record = ContractRecord(
             symbol=symbol,
             base_asset=base_asset,
@@ -76,30 +89,45 @@ def records_from_exchange_info(
             product_family="FUTURES" if classification_fields_valid else None,
             underlying_type=underlying_type,
             underlying_subtype=underlying_subtype,
+            is_crypto_underlying=(
+                underlying_type == "COIN" if classification_fields_valid else None
+            ),
+            is_stablecoin_underlying=(
+                "STABLECOIN" in normalized_subtypes if classification_fields_valid else None
+            ),
             is_leveraged_token=(
-                any("LEVERAGED" in subtype.upper() for subtype in underlying_subtype)
-                if classification_fields_valid and underlying_subtype is not None
+                any("LEVERAGED" in subtype for subtype in normalized_subtypes)
+                if classification_fields_valid
                 else None
             ),
-            classification_provenance=(
+            is_benchmark_btc=(symbol == "BTCUSDT" if classification_fields_valid else None),
+            is_eth=(symbol == "ETHUSDT" if classification_fields_valid else None),
+            scope_classification_status=(
+                "resolved_current_exchange_info" if classification_fields_valid else "unresolved"
+            ),
+            scope_classification_provenance=(
                 "binance_exchange_info_underlying_type_and_nonempty_subtype"
                 if classification_fields_valid
                 else None
             ),
-            onboard_timestamp=pd.to_datetime(item.get("onboardDate"), unit="ms", utc=True),
-            delivery_timestamp=(
+            exchange_info_onboard_at=pd.to_datetime(
+                item.get("onboardDate"), unit="ms", utc=True
+            ),
+            exchange_info_delivery_at=(
                 pd.to_datetime(delivery_ms, unit="ms", utc=True) if delivery_ms else None
             ),
-            status=item.get("status"),
+            latest_known_status=item.get("status"),
             metadata_acquired_at=acquired,
             metadata_source="https://fapi.binance.com/fapi/v1/exchangeInfo",
+            metadata_raw_snapshot_path=raw_snapshot_path,
+            metadata_raw_snapshot_sha256=raw_snapshot_sha256,
         )
         records.append(asdict(record))
     return pd.DataFrame.from_records(records)
 
 
 def filter_instrument_scope(
-    metadata: pd.DataFrame, stablecoin_underlyings: list[str]
+    metadata: pd.DataFrame, stablecoin_underlyings: list[str] | None = None
 ) -> pd.DataFrame:
     """Apply frozen scope from explicit metadata; unresolved classification fails closed."""
     required = {
@@ -112,13 +140,19 @@ def filter_instrument_scope(
         "product_family",
         "underlying_type",
         "underlying_subtype",
+        "is_crypto_underlying",
+        "is_stablecoin_underlying",
         "is_leveraged_token",
-        "classification_provenance",
+        "scope_classification_status",
+        "scope_classification_provenance",
     }
     missing = required - set(metadata.columns)
     if missing:
         raise ValueError(f"Instrument classification is unresolved; missing {sorted(missing)}")
-    stable = require_stablecoin_underlyings(stablecoin_underlyings)
+    # Retain configuration validation as a legacy conflict guard, but scope admission
+    # depends on captured per-contract evidence rather than list membership.
+    if stablecoin_underlyings is not None:
+        require_stablecoin_underlyings(stablecoin_underlyings)
 
     def valid_row(row: pd.Series) -> bool:
         try:
@@ -131,13 +165,21 @@ def filter_instrument_scope(
             require_binance_token(row["product_family"], "product_family")
             require_binance_token(row["underlying_type"], "underlying_type")
             require_identity_sequence(row["underlying_subtype"], "underlying_subtype")
-            require_canonical_text(row["classification_provenance"], "classification_provenance")
+            require_canonical_text(
+                row["scope_classification_provenance"],
+                "scope_classification_provenance",
+            )
         except IdentityValidationError:
             return False
-        return symbol == f"{base}{quote}" and type(row["is_leveraged_token"]) is bool
+        return (
+            symbol == f"{base}{quote}"
+            and type(row["is_crypto_underlying"]) is bool
+            and type(row["is_stablecoin_underlying"]) is bool
+            and type(row["is_leveraged_token"]) is bool
+            and row["scope_classification_status"] != "unresolved"
+        )
 
     canonical_identity = metadata.apply(valid_row, axis=1)
-    base = metadata["base_asset"]
     mask = (
         canonical_identity
         & metadata["quote_asset"].eq("USDT")
@@ -145,8 +187,8 @@ def filter_instrument_scope(
         & metadata["contract_type"].eq("PERPETUAL")
         & metadata["market_family"].eq("USDM")
         & metadata["product_family"].eq("FUTURES")
-        & metadata["underlying_type"].eq("COIN")
-        & ~base.isin(stable)
+        & metadata["is_crypto_underlying"].eq(True)
+        & metadata["is_stablecoin_underlying"].eq(False)
         & metadata["is_leveraged_token"].eq(False)
     )
     return metadata.loc[mask].copy()

@@ -46,8 +46,10 @@ and a nonempty, well-formed underlying-subtype list are both present; absent, nu
 or blank fields quarantine that contract.
 
 Target coverage is 2020-01-01 through the latest fully completed available data; a contract begins
-only when it existed. Eligibility starts at the later of the official futures listing timestamp and
-30 full calendar days after that timestamp, and requires valid market data. Where an official
+only when it existed. Eligibility requires an exact official Futures trading-start timestamp and
+starts after 30 full calendar days have elapsed from it, with valid market data. Current
+`exchangeInfo.onboardDate` and archive observations are retained separately and are not silently
+promoted to that exact boundary. Where an official
 delisting announcement timestamp is known, new scanner events stop at that time. No announcement
 timestamp may be invented. Preserve listing/onboard time, first valid data time, announcement time,
 last valid/trading time, delisting/delivery time, and latest observed status with provenance.
@@ -81,8 +83,14 @@ For each eligible tradable contract after a completed 4H bar:
    the median of the previous 20 completed rolling-24H observations, excluding current. The ratio is
    `vol_exp_24h_raw`, ranked to `vol_exp_24h_pct`. Overlap is retained by design.
 4. HotScore is the equal-weight arithmetic mean of those five percentiles. `hot_score_pct` is the
-   cross-sectional percentile of HotScore. `is_hot` means `hot_score_pct >= 0.9`; this is not an
-   optimized cutoff. Primary analysis uses D1–D10 across the full score distribution.
+cross-sectional percentile of HotScore. `is_hot` is exactly `hot_decile == 10`; it is not a second
+threshold rule. Primary analysis uses D1–D10 across the full score distribution.
+
+Percentile and HotScore ranks use average ties. Deciles are `ceil(percentile × 10)`, clipped to
+D1–D10. Consequently, a tie spanning the D9/D10 boundary receives its common average-rank decile:
+D10 can contain more than 10% of a cross-section or be empty. For unique ranks, D10 contains exactly
+one of 10, two of 20, and generally the highest `ceil(n/10)` only when the percentile mapping puts
+those ranks above 0.9. Small cross-sections use the same rule without a special minimum HOT count.
 
 Rows missing any component do not receive HotScore and cannot be HOT.
 

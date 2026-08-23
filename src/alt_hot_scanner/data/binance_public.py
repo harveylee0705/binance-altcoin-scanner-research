@@ -10,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,6 +58,46 @@ class DownloadRecord:
     checksum_verified: bool
     local_path: str
     payload_source: str
+
+
+@dataclass(frozen=True)
+class ArchiveIndexAudit:
+    page_count: int
+    returned_prefix_count: int
+    returned_key_count: int
+    unique_prefix_count: int
+    unique_key_count: int
+    any_page_truncated: bool
+    source_urls: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ArchiveIndexListing:
+    prefixes: tuple[str, ...]
+    keys: tuple[str, ...]
+    audit: ArchiveIndexAudit
+
+
+@dataclass(frozen=True)
+class ArchiveSymbolDiscovery:
+    symbols: tuple[str, ...]
+    quarantined_prefixes: tuple[str, ...]
+    audit: ArchiveIndexAudit
+
+
+@dataclass(frozen=True)
+class ArchiveMonthObservation:
+    symbol: str
+    first_archive_month: str
+    last_archive_month: str
+    archive_discovery_timestamp: str
+    archive_source_url: str
+    archive_discovery_provenance: str
+    archive_parser_version: str
+    index_page_count: int
+    returned_key_count: int
+    unique_archive_count: int
+    any_page_truncated: bool
 
 
 class ArchiveAcquisitionError(RuntimeError):
@@ -172,6 +213,10 @@ def _write_bytes_exclusive_atomic(path: str | Path, payload: bytes) -> None:
 def write_json_exclusive(path: str | Path, payload: Any) -> None:
     serialized = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
     _write_bytes_exclusive_atomic(path, serialized)
+
+
+def write_bytes_exclusive(path: str | Path, payload: bytes) -> None:
+    _write_bytes_exclusive_atomic(path, payload)
 
 
 def _read_url(url: str, timeout: int = 60) -> bytes:
@@ -585,15 +630,206 @@ def monthly_kline_key(symbol: str, interval: str, year_month: str) -> str:
     return validate_archive_object_key(key).object_key
 
 
-def list_archive_symbols() -> list[str]:
-    """Discover symbols from the official archive index, including later-delisted objects."""
+def list_archive_index(
+    prefix: str,
+    *,
+    delimiter: str | None = None,
+    page_observer: Callable[[int, str, bytes], None] | None = None,
+) -> ArchiveIndexListing:
+    """Read a complete, internally consistent S3 ListObjectsV2 result."""
+    canonical_prefix = require_canonical_text(prefix, "archive index prefix")
+    if not canonical_prefix.startswith("data/futures/um/monthly/klines/") or "\\" in canonical_prefix:
+        raise ValueError("Archive index prefix is outside the frozen USD-M monthly kline hierarchy")
+    if delimiter not in {None, "/"}:
+        raise ValueError("Archive index delimiter must be '/' or omitted")
+
+    namespace_uri = "http://s3.amazonaws.com/doc/2006-03-01/"
+    namespace = {"s3": namespace_uri}
+    continuation_token: str | None = None
+    seen_tokens: set[str] = set()
+    prefixes: list[str] = []
+    keys: list[str] = []
+    source_urls: list[str] = []
+    any_truncated = False
+
+    while True:
+        parameters = {"list-type": "2", "prefix": canonical_prefix}
+        if delimiter is not None:
+            parameters["delimiter"] = delimiter
+        if continuation_token is not None:
+            parameters["continuation-token"] = continuation_token
+        query = urllib.parse.urlencode(parameters)
+        url = f"{INDEX_HOST}?{query}"
+        source_urls.append(url)
+        payload = _read_url(url)
+        if page_observer is not None:
+            page_observer(len(source_urls), url, payload)
+        try:
+            root = ET.fromstring(payload)
+        except ET.ParseError as exc:
+            raise ValueError(f"Malformed archive-index XML on page {len(source_urls)}") from exc
+        if root.tag != f"{{{namespace_uri}}}ListBucketResult":
+            raise ValueError("Archive-index XML has an unexpected root or namespace")
+
+        truncated_nodes = root.findall("s3:IsTruncated", namespace)
+        if len(truncated_nodes) != 1 or truncated_nodes[0].text not in {"true", "false"}:
+            raise ValueError("Archive-index page requires one canonical IsTruncated value")
+        truncated = truncated_nodes[0].text == "true"
+        any_truncated = any_truncated or truncated
+
+        page_prefixes = [
+            node.text
+            for node in root.findall("s3:CommonPrefixes/s3:Prefix", namespace)
+        ]
+        page_keys = [node.text for node in root.findall("s3:Contents/s3:Key", namespace)]
+        if any(value is None or value == "" for value in [*page_prefixes, *page_keys]):
+            raise ValueError("Archive-index page contains an empty prefix or key")
+        if any(not value.startswith(canonical_prefix) for value in [*page_prefixes, *page_keys]):
+            raise ValueError("Archive-index page returned an object outside the requested prefix")
+
+        key_count_nodes = root.findall("s3:KeyCount", namespace)
+        if len(key_count_nodes) > 1:
+            raise ValueError("Archive-index page contains duplicate KeyCount fields")
+        if key_count_nodes:
+            try:
+                key_count = int(key_count_nodes[0].text or "")
+            except ValueError as exc:
+                raise ValueError("Archive-index KeyCount is malformed") from exc
+            if key_count != len(page_prefixes) + len(page_keys):
+                raise ValueError("Archive-index KeyCount disagrees with returned entries")
+
+        prefixes.extend(value for value in page_prefixes if value is not None)
+        keys.extend(value for value in page_keys if value is not None)
+        token_nodes = root.findall("s3:NextContinuationToken", namespace)
+        if len(token_nodes) > 1:
+            raise ValueError("Archive-index page contains duplicate continuation tokens")
+        next_token = token_nodes[0].text if token_nodes else None
+        if truncated:
+            if next_token is None or not next_token.strip():
+                raise ValueError("Truncated archive-index page has no usable continuation token")
+            next_token = require_canonical_text(next_token, "archive continuation token")
+            if next_token in seen_tokens:
+                raise ValueError("Archive-index pagination repeated a continuation token")
+            seen_tokens.add(next_token)
+            continuation_token = next_token
+            continue
+        if next_token is not None and next_token.strip():
+            raise ValueError("Untruncated archive-index page unexpectedly supplied a next token")
+        break
+
+    unique_prefixes = tuple(sorted(set(prefixes)))
+    unique_keys = tuple(sorted(set(keys)))
+    return ArchiveIndexListing(
+        prefixes=unique_prefixes,
+        keys=unique_keys,
+        audit=ArchiveIndexAudit(
+            page_count=len(source_urls),
+            returned_prefix_count=len(prefixes),
+            returned_key_count=len(keys),
+            unique_prefix_count=len(unique_prefixes),
+            unique_key_count=len(unique_keys),
+            any_page_truncated=any_truncated,
+            source_urls=tuple(source_urls),
+        ),
+    )
+
+
+def discover_archive_symbol_candidates(
+    *, page_observer: Callable[[int, str, bytes], None] | None = None
+) -> ArchiveSymbolDiscovery:
+    """Validate every symbol prefix, retaining noncanonical identities in quarantine."""
     prefix = "data/futures/um/monthly/klines/"
-    query = urllib.parse.urlencode({"list-type": "2", "prefix": prefix, "delimiter": "/"})
-    root = ET.fromstring(_read_url(f"{INDEX_HOST}?{query}"))
-    namespace = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-    prefixes = [node.text or "" for node in root.findall("s3:CommonPrefixes/s3:Prefix", namespace)]
-    symbols = {item.removeprefix(prefix).removesuffix("/") for item in prefixes if item}
-    return sorted(require_binance_token(symbol, "archive index symbol") for symbol in symbols)
+    listing = list_archive_index(prefix, delimiter="/", page_observer=page_observer)
+    symbols: list[str] = []
+    quarantined: list[str] = []
+    for item in listing.prefixes:
+        if not item.startswith(prefix) or not item.endswith("/"):
+            raise ValueError("Archive symbol prefix has an invalid hierarchy")
+        relative = item[len(prefix) : -1]
+        if "/" in relative:
+            raise ValueError("Archive symbol prefix contains unexpected nesting")
+        try:
+            symbols.append(require_binance_token(relative, "archive index symbol"))
+        except ValueError:
+            quarantined.append(relative)
+    unique_symbols = sorted(set(symbols))
+    audit = ArchiveIndexAudit(
+        page_count=listing.audit.page_count,
+        returned_prefix_count=listing.audit.returned_prefix_count,
+        returned_key_count=listing.audit.returned_key_count,
+        unique_prefix_count=listing.audit.unique_prefix_count,
+        unique_key_count=listing.audit.unique_key_count,
+        any_page_truncated=listing.audit.any_page_truncated,
+        source_urls=listing.audit.source_urls,
+    )
+    if len(unique_symbols) + len(set(quarantined)) != audit.unique_prefix_count:
+        raise ValueError("Archive symbol validation changed the unique-prefix count")
+    return ArchiveSymbolDiscovery(
+        symbols=tuple(unique_symbols),
+        quarantined_prefixes=tuple(sorted(set(quarantined))),
+        audit=audit,
+    )
+
+
+def discover_archive_symbols(
+    *, page_observer: Callable[[int, str, bytes], None] | None = None
+) -> tuple[list[str], ArchiveIndexAudit]:
+    """Return canonical symbols, failing if any official prefix cannot be represented safely."""
+    discovery = discover_archive_symbol_candidates(page_observer=page_observer)
+    if discovery.quarantined_prefixes:
+        raise ValueError(
+            "Archive discovery contains noncanonical symbol identities; use the lifecycle "
+            "candidate workflow to retain them in quarantine"
+        )
+    return list(discovery.symbols), discovery.audit
+
+
+def list_archive_symbols() -> list[str]:
+    """Compatibility wrapper returning complete historical archive symbol discovery."""
+    return discover_archive_symbols()[0]
+
+
+def discover_archive_months(
+    symbol: str,
+    *,
+    discovered_at: datetime | None = None,
+    page_observer: Callable[[int, str, bytes], None] | None = None,
+) -> ArchiveMonthObservation:
+    """Capture observed monthly 1H bounds without calling them lifecycle timestamps."""
+    canonical_symbol = require_binance_token(symbol, "archive symbol")
+    prefix = f"data/futures/um/monthly/klines/{canonical_symbol}/1h/"
+    listing = list_archive_index(prefix, page_observer=page_observer)
+    identities: dict[str, ArchiveObjectIdentity] = {}
+    for returned_key in listing.keys:
+        object_key = returned_key.removesuffix(".CHECKSUM")
+        try:
+            identity = validate_archive_object_key(object_key)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Unexpected object in monthly 1H archive listing for {canonical_symbol}"
+            ) from exc
+        if identity.symbol != canonical_symbol:
+            raise ValueError("Archive month listing returned a mismatched symbol")
+        identities[identity.object_key] = identity
+    if not identities:
+        raise ValueError(f"No monthly 1H archives found for {canonical_symbol}")
+    periods = sorted(identity.period for identity in identities.values())
+    timestamp = discovered_at or datetime.now(UTC)
+    return ArchiveMonthObservation(
+        symbol=canonical_symbol,
+        first_archive_month=periods[0],
+        last_archive_month=periods[-1],
+        archive_discovery_timestamp=timestamp.isoformat(),
+        archive_source_url=INDEX_HOST,
+        archive_discovery_provenance=(
+            "official_binance_public_s3_listobjectsv2_observed_data_bound_not_lifecycle_event"
+        ),
+        archive_parser_version="binance-s3-listobjectsv2-v1",
+        index_page_count=listing.audit.page_count,
+        returned_key_count=listing.audit.returned_key_count,
+        unique_archive_count=len(identities),
+        any_page_truncated=listing.audit.any_page_truncated,
+    )
 
 
 def fetch_exchange_info_snapshot(path: str | Path) -> dict:

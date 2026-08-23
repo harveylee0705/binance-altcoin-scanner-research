@@ -16,14 +16,19 @@ logical fields below. Nullable means “unknown/not computable,” never silentl
 | `product_family` | string | Must be canonical `FUTURES` |
 | `underlying_type` | string | Binance classification; v0.1 crypto scope requires `COIN` |
 | `underlying_subtype` | list[string] | Preserved Binance subtype tags |
+| `is_crypto_underlying` | bool? | Explicit evidence result; unknown remains null |
+| `is_stablecoin_underlying` | bool? | Explicit subtype/classification result, not a ticker-list inference |
 | `is_leveraged_token` | bool | Explicit classification, never inferred from a name suffix |
-| `classification_provenance` | string | Nonblank evidence/source; null means quarantine |
-| `onboard_timestamp` | timestamp | Official API onboard/listing field where preserved |
-| `first_valid_timestamp` | timestamp | First valid archived 1H open; observed lower data boundary |
-| `delisting_announcement_timestamp` | timestamp? | Official announcement publication time only |
-| `last_trading_timestamp` | timestamp? | Last valid/official trading boundary |
-| `delivery_timestamp` | timestamp? | API delivery/delisting field when meaningful |
-| `status` | string | Status observed at metadata acquisition, not historical state |
+| `scope_classification_status` | string | Resolved evidence tier or `unresolved`; unresolved fails closed |
+| `scope_classification_provenance` | string | Nonblank evidence/source; null means quarantine |
+| `exchange_info_onboard_at` | timestamp? | Current official API onboard field; not silently promoted to an announcement-proven trading start |
+| `official_trading_start_at` | timestamp? | Exact stated Futures trading start from accepted official announcement evidence |
+| `first_archive_month`, `last_archive_month` | YYYY-MM | Official archive-index observation bounds, not lifecycle events |
+| `first_valid_kline_at`, `last_valid_kline_at` | timestamp? | Independently established valid-kline boundaries only |
+| `delisting_announcement_published_at` | timestamp? | Official announcement publication time only; frozen no-new-event cutoff |
+| `official_last_trading_at` | timestamp? | Exact stated last-trading/settlement time, kept separate from publication |
+| `exchange_info_delivery_at` | timestamp? | Current API delivery field; active sentinels are preserved, not promoted |
+| `latest_known_status` | string | Status observed at metadata acquisition, never historical membership |
 | `metadata_acquired_at` | timestamp | When metadata response was captured |
 | `metadata_source` | string | URL/object and retrieval method |
 | `is_eth` | bool | True only for ETHUSDT |
@@ -58,7 +63,7 @@ open/close/low, volumes and trade count must be nonnegative, and timestamps must
 | `continuity_segment` | Increments after a missing 4H boundary; rolling features never cross it |
 | OHLC/volumes/trades | First/max/min/last/sum aggregation |
 | `is_eligible` | Point-in-time universe and 30-day-age result |
-| `contract_age_days` | Calendar elapsed time since official onboard timestamp |
+| `contract_age_days` | Calendar elapsed time since exact official Futures trading start |
 | `return_1d`, `return_3d`, `return_7d` | 6/18/42-bar close returns |
 | `rs_1d_pct`, `rs_3d_pct`, `rs_7d_pct` | Eligible-universe timestamp ranks |
 | `vol_exp_4h_raw`, `vol_exp_4h_pct` | Current 4H volume / prior-30 median and rank |
@@ -75,7 +80,7 @@ open/close/low, volumes and trade count must be nonnegative, and timestamps must
 | `hot_score` | Equal mean of five component percentiles |
 | `hot_score_pct` | Timestamp-level cross-sectional HotScore rank |
 | `hot_decile` | D1–D10 using deterministic percentile-to-decile mapping |
-| `is_hot` | `hot_score_pct >= 0.9` |
+| `is_hot` | Exactly `hot_decile == 10` |
 | `episode_id`, `is_episode_start` | Independent HOT-state episode fields |
 
 ## Outcome fields

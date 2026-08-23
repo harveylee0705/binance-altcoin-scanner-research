@@ -55,6 +55,10 @@ and `PERPETUAL`, exclude stablecoin and leveraged-token underlyings, and reject 
 products based on captured metadata. Historical archive symbols missing authoritative classification
 remain quarantined rather than guessed into the universe.
 
+The reusable pipeline enforces this classification centrally. Leveraged-token status comes from
+explicit metadata/provenance; suffix matching is prohibited because it misclassifies legitimate
+assets such as JUP and SYRUP.
+
 ## Statistical dependence and inference
 
 Overlapping 24H volume observations and forward horizons create serial dependence. Every 4H eligible

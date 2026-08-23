@@ -74,8 +74,15 @@ def validate_normalized_1h(frame: pd.DataFrame) -> None:
         raise ValueError(f"Missing normalized fields: {sorted(missing)}")
     if frame.duplicated(["symbol", "open_time"]).any():
         raise ValueError("Duplicate symbol/open_time bars")
-    if not frame["open_time"].dt.tz:
-        raise ValueError("open_time must be timezone-aware UTC")
+    if str(frame["open_time"].dt.tz).upper() != "UTC":
+        raise ValueError("open_time must use the UTC timezone")
+    if str(frame["close_time"].dt.tz).upper() != "UTC":
+        raise ValueError("close_time must use the UTC timezone")
+    ordered = frame.groupby("symbol", sort=False)["open_time"].apply(
+        lambda values: values.is_monotonic_increasing
+    )
+    if not ordered.all():
+        raise ValueError("1H bars must be ordered by open_time within symbol")
     aligned = (
         frame["open_time"].dt.minute.eq(0)
         & frame["open_time"].dt.second.eq(0)
@@ -83,6 +90,9 @@ def validate_normalized_1h(frame: pd.DataFrame) -> None:
     )
     if not aligned.all():
         raise ValueError("1H opens must align to exact UTC hours")
+    expected_close = frame["open_time"] + pd.Timedelta(hours=1) - pd.Timedelta(milliseconds=1)
+    if not frame["close_time"].eq(expected_close).all():
+        raise ValueError("close_time must equal open_time + 1 hour - 1 millisecond")
     if (frame[["open", "high", "low", "close"]] <= 0).any().any():
         raise ValueError("OHLC prices must be positive")
     high_floor = frame[["open", "low", "close"]].max(axis=1)

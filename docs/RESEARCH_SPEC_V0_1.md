@@ -1,7 +1,9 @@
 # Research Specification — Scanner v0.1
 
-Status: **frozen before outcome inspection**  
-Internal timezone: **UTC**  
+Status: **frozen before outcome inspection**
+
+Internal timezone: **UTC**
+
 Score scale: **0.0–1.0**
 
 ## Objective and sequence
@@ -34,6 +36,11 @@ that existed at the historical timestamp, including later-delisted contracts. Ex
 tradable rows but retain its data as benchmark. Include ETHUSDT with `is_eth=true`. Exclude stablecoin
 underlyings, leveraged tokens, COIN-M, delivery/quarterly, USDC, and non-crypto/TradFi perpetuals.
 Spot and margin are out of scope.
+
+Scope classification is a mandatory pipeline invariant, not a caller convention. It requires
+explicit quote asset, margin asset, contract type, underlying type, and leveraged-token evidence.
+Unresolved classification fails closed. Token-name suffixes such as `UP` are not classification
+evidence because legitimate assets (for example JUP and SYRUP) share those characters.
 
 Target coverage is 2020-01-01 through the latest fully completed available data; a contract begins
 only when it existed. Eligibility starts at the later of the official futures listing timestamp and

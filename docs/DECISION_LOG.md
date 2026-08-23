@@ -53,3 +53,15 @@ Known gap: no documented official bulk endpoint provides historical delisting an
 They remain nullable and modular; last valid data is retained but not misrepresented as announcement
 time.
 
+## 2026-08-23 — Milestone review remediation cycle 1
+
+Decision: make complete instrument classification a mandatory reusable-pipeline invariant, remove
+the token-name suffix heuristic, and fail closed on missing classification fields. Require normalized
+open and close timestamps to use UTC, require ordered symbol rows, and require each hourly close time
+to equal open plus one hour minus one millisecond. Correct the full plan to end at the prior completed
+month and persist the complete published/computed checksum lineage in full-download attempts.
+
+Reason: independent review found that callers could bypass scope filtering, legitimate JUP/SYRUP
+contracts were excluded by suffix, and malformed/non-UTC close times could affect completed-bar and
+listing-age logic. No scanner outcomes informed these changes; they correct specification-enforcement
+and auditability defects.

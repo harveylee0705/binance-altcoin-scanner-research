@@ -11,6 +11,14 @@ from alt_hot_scanner.data.binance_public import list_archive_symbols, monthly_kl
 from alt_hot_scanner.utils.config import load_config
 
 
+def last_completed_month(now: pd.Timestamp) -> pd.Period:
+    """Return the month before the current UTC calendar month."""
+    timestamp = pd.Timestamp(now)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+    return timestamp.to_period("M") - 1
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare, but do not execute, a full archive plan")
     parser.add_argument("--config", default="config/research_v0_1.yaml")
@@ -25,11 +33,7 @@ def main() -> None:
     symbols = [symbol for symbol in list_archive_symbols() if symbol.endswith("USDT")]
     start = pd.Timestamp(config["data"]["start"]).tz_localize(None).to_period("M")
     now = pd.Timestamp.now(tz="UTC")
-    end = (
-        pd.Period(args.end_month, freq="M")
-        if args.end_month
-        else (now - pd.offsets.MonthBegin()).tz_localize(None).to_period("M")
-    )
+    end = pd.Period(args.end_month, freq="M") if args.end_month else last_completed_month(now)
     months = [str(period) for period in pd.period_range(start, end, freq="M")]
     payload = {
         "created_at": datetime.now(UTC).isoformat(),

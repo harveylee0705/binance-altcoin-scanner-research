@@ -25,6 +25,7 @@ class DownloadRecord:
     computed_sha256: str
     checksum_verified: bool
     local_path: str
+    payload_source: str
 
 
 def _read_url(url: str, timeout: int = 60) -> bytes:
@@ -52,9 +53,11 @@ def download_verified_archive(
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and not overwrite:
         payload = destination.read_bytes()
+        payload_source = "existing_local_verified_against_published_checksum"
     else:
         payload = _read_url(url)
         destination.write_bytes(payload)
+        payload_source = "downloaded_http_200"
     computed = hashlib.sha256(payload).hexdigest()
     if computed != published:
         raise ValueError(
@@ -69,6 +72,7 @@ def download_verified_archive(
         computed_sha256=computed,
         checksum_verified=True,
         local_path=str(destination),
+        payload_source=payload_source,
     )
 
 

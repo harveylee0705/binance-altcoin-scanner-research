@@ -12,6 +12,10 @@ logical fields below. Nullable means “unknown/not computable,” never silentl
 | `quote_asset` | string | Must be `USDT` for tradable v0.1 universe |
 | `margin_asset` | string | Must be `USDT` |
 | `contract_type` | string | Must be `PERPETUAL` |
+| `underlying_type` | string | Binance classification; v0.1 crypto scope requires `COIN` |
+| `underlying_subtype` | list[string] | Preserved Binance subtype tags |
+| `is_leveraged_token` | bool | Explicit classification, never inferred from a name suffix |
+| `classification_provenance` | string | Evidence/source for the instrument classification |
 | `onboard_timestamp` | timestamp | Official API onboard/listing field where preserved |
 | `first_valid_timestamp` | timestamp | First valid archived 1H open; observed lower data boundary |
 | `delisting_announcement_timestamp` | timestamp? | Official announcement publication time only |
@@ -84,3 +88,7 @@ when the signal lacks ATR/full authorized data. `future_bar_count_*` makes censo
 Each object attempt records object key/URL, symbol, interval, period, retrieval timestamp, HTTP
 result, bytes, published checksum, computed checksum, verification status, coverage, row count,
 missing/duplicate counts, and error text. Raw ZIPs and metadata responses are append-only.
+
+Download attempts additionally retain `url`, `retrieved_at`, `payload_source`, parsed symbol,
+interval, period, and HTTP/cache result. Row coverage and missing-bar counts are added by the
+normalization/processing quality manifest because they require reading the verified archive.

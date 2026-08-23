@@ -12,6 +12,8 @@ logical fields below. Nullable means “unknown/not computable,” never silentl
 | `quote_asset` | string | Must be `USDT` for tradable v0.1 universe |
 | `margin_asset` | string | Must be `USDT` |
 | `contract_type` | string | Must be `PERPETUAL` |
+| `market_family` | string | Must be canonical `USDM`; derived from the USD-M source endpoint |
+| `product_family` | string | Must be canonical `FUTURES` |
 | `underlying_type` | string | Binance classification; v0.1 crypto scope requires `COIN` |
 | `underlying_subtype` | list[string] | Preserved Binance subtype tags |
 | `is_leveraged_token` | bool | Explicit classification, never inferred from a name suffix |
@@ -96,3 +98,10 @@ verification mismatch are failures. Row coverage and missing-bar counts are adde
 normalization/processing quality manifest because they require reading the verified archive. An
 occupied raw path is never overwritten; a newly published mismatch is preserved as a structured
 failure so earlier manifest-to-byte lineage remains valid.
+
+Object keys must exactly match
+`data/futures/um/monthly/klines/<SYMBOL>/1h/<SYMBOL>-1h-<YYYY-MM>.zip`, with canonical uppercase
+ASCII symbol identity. Manifest paths must equal the independently reconstructed canonical path
+under `data/raw`. Before processing, the current Binance sidecar, manifest checksum evidence, and a
+fresh SHA-256 of the local file must all agree. Attempt, slice, metadata, and quality manifests use
+collision-resistant run IDs and exclusive no-replace creation.

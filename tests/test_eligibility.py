@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 from conftest import make_4h
 
 from alt_hot_scanner.universe.eligibility import apply_point_in_time_eligibility
@@ -41,3 +42,12 @@ def test_missing_listing_evidence_fails_closed() -> None:
         bars, _contract("2023-01-01").assign(onboard_timestamp=pd.NaT)
     )
     assert not bool(result.iloc[0]["is_eligible"])
+
+
+@pytest.mark.parametrize("symbol", ["BTCUSDT ", "ethusdt", 123])
+def test_benchmark_and_eth_tagging_reject_noncanonical_symbol_identity(symbol: object) -> None:
+    bars = make_4h("BTCUSDT", 1, "2023-03-01T00:00:00Z")
+    bars["symbol"] = symbol
+    contracts = _contract("2023-01-01").assign(symbol=symbol)
+    with pytest.raises(ValueError):
+        apply_point_in_time_eligibility(bars, contracts)

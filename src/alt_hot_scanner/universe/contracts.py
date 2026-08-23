@@ -5,6 +5,14 @@ from datetime import UTC, datetime
 
 import pandas as pd
 
+from alt_hot_scanner.identity import (
+    IdentityValidationError,
+    require_binance_token,
+    require_canonical_text,
+    require_identity_sequence,
+    require_stablecoin_underlyings,
+)
+
 
 @dataclass(frozen=True)
 class ContractRecord:
@@ -13,6 +21,8 @@ class ContractRecord:
     quote_asset: str | None
     margin_asset: str | None
     contract_type: str | None
+    market_family: str | None
+    product_family: str | None
     underlying_type: str | None
     underlying_subtype: tuple[str, ...] | None
     is_leveraged_token: bool | None
@@ -36,33 +46,35 @@ def records_from_exchange_info(
     for item in payload["symbols"]:
         delivery_ms = item.get("deliveryDate")
         raw_subtype = item.get("underlyingSubType")
-        valid_subtype = (
-            isinstance(raw_subtype, list)
-            and bool(raw_subtype)
-            and all(isinstance(value, str) and value.strip() for value in raw_subtype)
-        )
-        underlying_subtype = tuple(raw_subtype) if valid_subtype else None
-        classification_fields_valid = (
-            all(
-                isinstance(item.get(field), str) and item[field].strip()
-                for field in (
-                    "symbol",
-                    "baseAsset",
-                    "quoteAsset",
-                    "marginAsset",
-                    "contractType",
-                    "underlyingType",
-                )
-            )
-            and valid_subtype
-        )
+        try:
+            symbol = require_binance_token(item.get("symbol"), "symbol")
+            base_asset = require_binance_token(item.get("baseAsset"), "baseAsset")
+            quote_asset = require_binance_token(item.get("quoteAsset"), "quoteAsset")
+            margin_asset = require_binance_token(item.get("marginAsset"), "marginAsset")
+            contract_type = require_binance_token(item.get("contractType"), "contractType")
+            underlying_type = require_binance_token(item.get("underlyingType"), "underlyingType")
+            underlying_subtype = require_identity_sequence(raw_subtype, "underlyingSubType")
+            if symbol != f"{base_asset}{quote_asset}":
+                raise IdentityValidationError("symbol must equal baseAsset plus quoteAsset")
+            classification_fields_valid = True
+        except IdentityValidationError:
+            symbol = item.get("symbol")
+            base_asset = item.get("baseAsset")
+            quote_asset = item.get("quoteAsset")
+            margin_asset = item.get("marginAsset")
+            contract_type = item.get("contractType")
+            underlying_type = item.get("underlyingType")
+            underlying_subtype = None
+            classification_fields_valid = False
         record = ContractRecord(
-            symbol=item.get("symbol"),
-            base_asset=item.get("baseAsset"),
-            quote_asset=item.get("quoteAsset"),
-            margin_asset=item.get("marginAsset"),
-            contract_type=item.get("contractType"),
-            underlying_type=item.get("underlyingType"),
+            symbol=symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            margin_asset=margin_asset,
+            contract_type=contract_type,
+            market_family="USDM" if classification_fields_valid else None,
+            product_family="FUTURES" if classification_fields_valid else None,
+            underlying_type=underlying_type,
             underlying_subtype=underlying_subtype,
             is_leveraged_token=(
                 any("LEVERAGED" in subtype.upper() for subtype in underlying_subtype)
@@ -96,6 +108,8 @@ def filter_instrument_scope(
         "quote_asset",
         "margin_asset",
         "contract_type",
+        "market_family",
+        "product_family",
         "underlying_type",
         "underlying_subtype",
         "is_leveraged_token",
@@ -104,30 +118,35 @@ def filter_instrument_scope(
     missing = required - set(metadata.columns)
     if missing:
         raise ValueError(f"Instrument classification is unresolved; missing {sorted(missing)}")
-    stable = set(stablecoin_underlyings)
-    symbol = metadata["symbol"].astype("string")
-    base = metadata["base_asset"].astype("string")
-    subtype_is_explicit = metadata["underlying_subtype"].map(
-        lambda value: (
-            isinstance(value, (tuple, list))
-            and bool(value)
-            and all(isinstance(item, str) and item.strip() for item in value)
-        )
-    )
-    provenance = metadata["classification_provenance"].astype("string")
+    stable = require_stablecoin_underlyings(stablecoin_underlyings)
+
+    def valid_row(row: pd.Series) -> bool:
+        try:
+            symbol = require_binance_token(row["symbol"], "symbol")
+            base = require_binance_token(row["base_asset"], "base_asset")
+            quote = require_binance_token(row["quote_asset"], "quote_asset")
+            require_binance_token(row["margin_asset"], "margin_asset")
+            require_binance_token(row["contract_type"], "contract_type")
+            require_binance_token(row["market_family"], "market_family")
+            require_binance_token(row["product_family"], "product_family")
+            require_binance_token(row["underlying_type"], "underlying_type")
+            require_identity_sequence(row["underlying_subtype"], "underlying_subtype")
+            require_canonical_text(row["classification_provenance"], "classification_provenance")
+        except IdentityValidationError:
+            return False
+        return symbol == f"{base}{quote}" and type(row["is_leveraged_token"]) is bool
+
+    canonical_identity = metadata.apply(valid_row, axis=1)
+    base = metadata["base_asset"]
     mask = (
-        symbol.notna()
-        & symbol.str.strip().ne("")
-        & base.notna()
-        & base.str.strip().ne("")
+        canonical_identity
         & metadata["quote_asset"].eq("USDT")
         & metadata["margin_asset"].eq("USDT")
         & metadata["contract_type"].eq("PERPETUAL")
+        & metadata["market_family"].eq("USDM")
+        & metadata["product_family"].eq("FUTURES")
         & metadata["underlying_type"].eq("COIN")
         & ~base.isin(stable)
         & metadata["is_leveraged_token"].eq(False)
-        & subtype_is_explicit
-        & provenance.notna()
-        & provenance.str.strip().ne("")
     )
     return metadata.loc[mask].copy()

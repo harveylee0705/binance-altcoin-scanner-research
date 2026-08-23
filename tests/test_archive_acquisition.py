@@ -57,7 +57,7 @@ def test_checksum_mismatch_preserves_existing_raw_bytes_and_hash_evidence(
     with pytest.raises(ArchiveAcquisitionError) as mismatch:
         download_verified_archive(KEY, tmp_path)
     attempt = failure_attempt(KEY, mismatch.value)
-    assert mismatch.value.stage == "checksum_verification"
+    assert mismatch.value.stage == "local_corruption"
     assert destination.read_bytes() == old_payload
     assert attempt["published_sha256"] == published
     assert attempt["computed_sha256"] == hashlib.sha256(old_payload).hexdigest()
@@ -73,13 +73,13 @@ def test_downloaded_and_cached_success_are_both_verified(
 
     def fake_read(url: str) -> bytes:
         if url.endswith(".CHECKSUM"):
-            return f"{published}  archive.zip\n".encode()
+            return f"{published}  {KEY.rsplit('/', 1)[-1]}\n".encode()
         return payload
 
     monkeypatch.setattr(public_data, "_read_url", fake_read)
     downloaded = download_verified_archive(KEY, tmp_path)
     cached = download_verified_archive(KEY, tmp_path)
-    assert downloaded.payload_source == "downloaded_http_200"
+    assert downloaded.payload_source == "downloaded_verified_then_atomic_no_replace_install"
     assert cached.payload_source == "existing_local_verified_against_published_checksum"
     assert downloaded.published_sha256 == downloaded.computed_sha256 == published
     assert (tmp_path / KEY).read_bytes() == payload

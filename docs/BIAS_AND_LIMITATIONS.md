@@ -42,6 +42,12 @@ If a published checksum changes, the existing raw object is not replaced. The ac
 both hashes recorded; later work may add a separate content-addressed/versioned raw object without
 mutating the original path. Missing checksum sidecars are verification failures, not missing market
 data, unless a separate archive-object probe confirms a 404.
+Remote bytes are first written to an isolated temporary file and independently hashed before an
+atomic no-replace install. Canonical paths are derived only from the strict Binance USD-M monthly 1H
+object-key grammar and are resolved under the configured raw root. Processing does not trust a prior
+`verified` flag: it validates each manifest entry, re-fetches the exact named checksum sidecar, and
+re-hashes current local bytes immediately before parsing. Manifest and metadata writes use exclusive,
+collision-resistant no-replace installation.
 Rolling features reset after a missing 4H boundary, outcome labels require an exact gap-free elapsed
 horizon, and a later HOT row after a gap starts a new episode.
 
@@ -65,6 +71,11 @@ assets such as JUP and SYRUP.
 Missing/null/empty/malformed underlying-subtype evidence or blank identity/provenance fields are
 quarantined. This is intentionally stricter than treating absence of a leveraged tag as proof of a
 normal crypto underlying.
+All classification-bearing symbols, assets, product types, subtype labels, and provenance values
+pass one canonical identity boundary before scope decisions. Wrong types, padding, control
+characters, non-ASCII/confusable encodings, noncanonical casing for Binance tokens, and inconsistent
+symbol/base/quote identities are quarantined rather than trimmed, coerced, or recased. Stablecoin,
+BTC, and ETH decisions therefore operate only on validated canonical identities.
 
 ## Statistical dependence and inference
 

@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from alt_hot_scanner.identity import require_binance_token
+
 KLINE_COLUMNS = [
     "open_time",
     "open",
@@ -25,6 +27,7 @@ KLINE_COLUMNS = [
 
 def normalize_kline_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """Normalize a Binance 12-column kline frame and enforce its data contract."""
+    symbol = require_binance_token(symbol, "symbol")
     if raw.shape[1] != len(KLINE_COLUMNS):
         raise ValueError(f"Expected 12 Binance kline columns, found {raw.shape[1]}")
     frame = raw.copy()
@@ -72,6 +75,11 @@ def validate_normalized_1h(frame: pd.DataFrame) -> None:
     missing = required - set(frame.columns)
     if missing:
         raise ValueError(f"Missing normalized fields: {sorted(missing)}")
+    validated_symbols: set[str] = set()
+    for position, value in enumerate(frame["symbol"]):
+        if type(value) is str and value in validated_symbols:
+            continue
+        validated_symbols.add(require_binance_token(value, f"symbol[{position}]"))
     if frame.duplicated(["symbol", "open_time"]).any():
         raise ValueError("Duplicate symbol/open_time bars")
     if str(frame["open_time"].dt.tz).upper() != "UTC":

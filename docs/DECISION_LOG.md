@@ -78,3 +78,15 @@ while preserving every available hash and failing full processing on verificatio
 Reason: remediation review 1 found the prior fix partial for malformed classification inputs and
 failure-path manifests, plus a direct raw overwrite bypass. These are implementation/auditability
 corrections made without inspecting scanner outcomes, validation, or holdout data.
+
+## 2026-08-23 — One-time additional acquisition-boundary remediation authorization
+
+Decision: accept the user's narrow authorization for one additional implementation-integrity
+attempt after the two prior remediation cycles. The attempt is limited to canonical identity
+validation, strict archive-key and raw-root confinement, processing-time checksum verification,
+verified no-replace raw installation, and collision-safe exclusive manifest creation.
+
+Reason: the final independent gate at `2f9d8ab` identified five remaining acquisition-boundary
+blockers. Scanner features, HotScore, structure and outcome definitions, episodes, baselines,
+chronological splits, and advancement criteria remain frozen. No validation/holdout inspection,
+performance analysis, or full-history acquisition is authorized.

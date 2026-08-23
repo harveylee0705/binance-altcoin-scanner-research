@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
 
-from alt_hot_scanner.data.binance_public import list_archive_symbols, monthly_kline_key
+from alt_hot_scanner.data.binance_public import (
+    collision_resistant_run_id,
+    list_archive_symbols,
+    monthly_kline_key,
+    write_json_exclusive,
+)
 from alt_hot_scanner.utils.config import load_config
 
 
@@ -49,8 +53,9 @@ def main() -> None:
             monthly_kline_key(symbol, "1h", month) for symbol in symbols for month in months
         ],
     }
-    target = root / "reports" / "full_download_plan.json"
-    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    run_id = collision_resistant_run_id()
+    target = root / "reports" / f"full_download_plan_{run_id}.json"
+    write_json_exclusive(target, payload)
     print(f"Prepared {len(payload['objects']):,} candidate object keys in {target}")
     print("No full-history market data was downloaded.")
 

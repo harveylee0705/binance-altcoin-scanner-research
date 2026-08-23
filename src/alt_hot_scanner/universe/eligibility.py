@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from alt_hot_scanner.identity import require_binance_token
+
 
 def apply_point_in_time_eligibility(
     bars: pd.DataFrame,
@@ -15,6 +17,14 @@ def apply_point_in_time_eligibility(
     missing = required - set(contracts.columns)
     if missing:
         raise ValueError(f"Contract metadata is missing {sorted(missing)}")
+    for source_name, values in (("bars", bars["symbol"]), ("contracts", contracts["symbol"])):
+        validated_symbols: set[str] = set()
+        for position, value in enumerate(values):
+            if type(value) is str and value in validated_symbols:
+                continue
+            validated_symbols.add(
+                require_binance_token(value, f"{source_name}.symbol[{position}]")
+            )
     if contracts["symbol"].duplicated().any():
         raise ValueError("Contract metadata must have one row per symbol")
 

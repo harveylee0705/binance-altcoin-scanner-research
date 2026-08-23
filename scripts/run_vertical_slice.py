@@ -9,10 +9,12 @@ import pandas as pd
 
 from alt_hot_scanner.data.aggregate import aggregate_1h_to_4h
 from alt_hot_scanner.data.binance_public import (
+    collision_resistant_run_id,
     download_verified_archive,
     fetch_exchange_info_snapshot,
     monthly_kline_key,
     write_download_manifest,
+    write_json_exclusive,
 )
 from alt_hot_scanner.data.normalize import read_kline_zip
 from alt_hot_scanner.pipeline import build_vertical_slice
@@ -41,7 +43,7 @@ def main() -> None:
     ):
         raise PermissionError("Slice analysis_end exceeds development split")
 
-    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    run_id = collision_resistant_run_id()
     raw_root = root / "data" / "raw"
     records = []
     quality_records = []
@@ -76,8 +78,8 @@ def main() -> None:
         normalized.append(symbol_data)
 
     write_download_manifest(records, raw_root / "manifests" / f"slice_{run_id}.json")
-    (raw_root / "manifests" / f"slice_quality_{run_id}.json").write_text(
-        json.dumps(quality_records, indent=2), encoding="utf-8"
+    write_json_exclusive(
+        raw_root / "manifests" / f"slice_quality_{run_id}.json", quality_records
     )
     snapshot_path = raw_root / "metadata" / f"exchange_info_{run_id}.json"
     exchange_info = fetch_exchange_info_snapshot(snapshot_path)
@@ -126,7 +128,7 @@ def main() -> None:
         "metadata_snapshot": str(snapshot_path),
     }
     report_path = root / "reports" / f"vertical_slice_audit_{run_id}.json"
-    report_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_json_exclusive(report_path, summary)
     print(json.dumps(summary, indent=2))
 
 

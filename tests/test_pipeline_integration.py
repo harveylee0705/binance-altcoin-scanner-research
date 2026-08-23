@@ -27,6 +27,8 @@ def test_synthetic_end_to_end_vertical_slice() -> None:
                 "quote_asset": "USDT",
                 "margin_asset": "USDT",
                 "contract_type": "PERPETUAL",
+                "market_family": "USDM",
+                "product_family": "FUTURES",
                 "underlying_type": "COIN",
                 "underlying_subtype": ("synthetic-crypto",),
                 "is_leveraged_token": False,

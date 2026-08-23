@@ -19,6 +19,8 @@ def _metadata(symbol: str, **overrides: object) -> dict:
         "quote_asset": "USDT",
         "margin_asset": "USDT",
         "contract_type": "PERPETUAL",
+        "market_family": "USDM",
+        "product_family": "FUTURES",
         "underlying_type": "COIN",
         "underlying_subtype": ("synthetic-crypto",),
         "is_leveraged_token": False,
@@ -124,3 +126,75 @@ def test_blank_required_classification_values_are_excluded(field: str, value: ob
     metadata = pd.DataFrame([row])
     scoped = filter_instrument_scope(metadata, config["universe"]["stablecoin_underlyings"])
     assert scoped.empty
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("symbol", "USDCUSDT "),
+        ("base_asset", " USDC"),
+        ("base_asset", "usdc"),
+        ("quote_asset", "USDT\t"),
+        ("margin_asset", "usdt"),
+        ("contract_type", "PERPETUAL\n"),
+        ("market_family", "USD-M"),
+        ("product_family", "futures"),
+        ("underlying_type", "coin"),
+        ("classification_provenance", " synthetic_test_fixture"),
+    ],
+)
+def test_noncanonical_identity_cannot_bypass_stablecoin_exclusion(
+    field: str, value: object
+) -> None:
+    config = load_config("config/research_v0_1.yaml")
+    row = _metadata("USDCUSDT")
+    row[field] = value
+    scoped = filter_instrument_scope(pd.DataFrame([row]), config["universe"]["stablecoin_underlyings"])
+    assert scoped.empty
+
+
+@pytest.mark.parametrize("value", [123, b"USDC", ["USDC"], 0.0])
+def test_wrong_typed_asset_identity_is_quarantined(value: object) -> None:
+    config = load_config("config/research_v0_1.yaml")
+    row = _metadata("USDCUSDT", base_asset=value)
+    scoped = filter_instrument_scope(pd.DataFrame([row]), config["universe"]["stablecoin_underlyings"])
+    assert scoped.empty
+
+
+@pytest.mark.parametrize("value", [0, "false", None])
+def test_wrong_typed_leveraged_token_evidence_is_quarantined(value: object) -> None:
+    config = load_config("config/research_v0_1.yaml")
+    row = _metadata("JUPUSDT", is_leveraged_token=value)
+    scoped = filter_instrument_scope(pd.DataFrame([row]), config["universe"]["stablecoin_underlyings"])
+    assert scoped.empty
+
+
+def test_padded_exchange_info_identity_is_quarantined_before_classification() -> None:
+    config = load_config("config/research_v0_1.yaml")
+    normalized = records_from_exchange_info(
+        {
+            "symbols": [
+                {
+                    "symbol": "USDCUSDT",
+                    "baseAsset": "USDC ",
+                    "quoteAsset": "USDT",
+                    "marginAsset": "USDT",
+                    "contractType": "PERPETUAL",
+                    "underlyingType": "COIN",
+                    "underlyingSubType": ["Stablecoin"],
+                }
+            ]
+        }
+    )
+    assert filter_instrument_scope(
+        normalized, config["universe"]["stablecoin_underlyings"]
+    ).empty
+    assert pd.isna(normalized.iloc[0]["classification_provenance"])
+
+
+def test_symbol_must_match_canonical_base_and_quote_identity() -> None:
+    config = load_config("config/research_v0_1.yaml")
+    row = _metadata("ETHUSDT", base_asset="BTC")
+    assert filter_instrument_scope(
+        pd.DataFrame([row]), config["universe"]["stablecoin_underlyings"]
+    ).empty

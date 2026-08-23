@@ -64,24 +64,30 @@ To prepare a scalable download manifest without downloading full history:
 ```
 
 This discovers archived symbols (including delisted ones) from the object index and emits expected
-monthly 1H object keys. It is a planning artifact; missing objects must be logged, not filled.
+monthly 1H object keys to a collision-resistant, exclusively created plan filename. It is a planning
+artifact; missing objects must be logged, not filled. Use the exact printed plan path below.
 
 The prepared full-data path is resumable and deliberately requires an execution switch:
 
 ```powershell
 # Dry-run validation only (safe default)
-.venv\Scripts\python scripts/download_from_plan.py
+.venv\Scripts\python scripts/download_from_plan.py --plan reports/<PRINTED_PLAN>.json
 
 # Future explicit execution, after the historical contract catalog is approved
-.venv\Scripts\python scripts/download_from_plan.py --execute --workers 4
+.venv\Scripts\python scripts/download_from_plan.py `
+  --plan reports/<PRINTED_PLAN>.json --execute --workers 4
 .venv\Scripts\python scripts/process_downloaded_archives.py `
   --attempt-manifest data/raw/manifests/full_download_attempts_<RUN_ID>.json
 ```
 
-The downloader verifies every checksum and writes successes, missing objects, and failures to an
-append-only attempt manifest. Processing is per symbol, rejects duplicates/incomplete 4H groups, and
-writes partitioned Parquet, avoiding an all-history in-memory normalization step. Do not execute the
-full plan until historical instrument classification and lifecycle metadata are resolved.
+The downloader accepts only the exact Binance USD-M monthly 1H key grammar, writes remote bytes to
+an isolated temporary file, verifies the named checksum sidecar, and atomically installs with
+no-replace semantics. It writes successes, missing objects, and classified failures to an exclusive
+attempt manifest. Processing treats that manifest as untrusted: it reconstructs and confines every
+canonical path, retrieves and validates the published sidecar again, and hashes the current local
+bytes immediately before parsing. Processing is per symbol, rejects duplicates/incomplete 4H groups,
+and writes partitioned Parquet, avoiding an all-history in-memory normalization step. Do not execute
+the full plan until historical instrument classification and lifecycle metadata are resolved.
 
 ## Tests and quality checks
 

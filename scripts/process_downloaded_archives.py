@@ -7,6 +7,12 @@ from pathlib import Path
 import pandas as pd
 
 from alt_hot_scanner.data.aggregate import aggregate_1h_to_4h
+from alt_hot_scanner.data.binance_public import (
+    collision_resistant_run_id,
+    validate_archive_object_key,
+    validate_manifest_archive,
+    write_json_exclusive,
+)
 from alt_hot_scanner.data.normalize import read_kline_zip
 
 
@@ -22,7 +28,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
+    raw_root = root / "data" / "raw"
     attempts = json.loads((root / args.attempt_manifest).read_text(encoding="utf-8"))
+    if type(attempts) is not list or any(type(item) is not dict for item in attempts):
+        raise ValueError("Attempt manifest must be a list of objects")
+    allowed_statuses = {"verified", "missing", "failed"}
+    if any(item.get("status") not in allowed_statuses for item in attempts):
+        raise ValueError("Attempt manifest contains an invalid status")
     failures = [item for item in attempts if item["status"] == "failed"]
     if failures:
         raise RuntimeError(
@@ -32,18 +44,18 @@ def main() -> None:
     for item in attempts:
         if item["status"] != "verified":
             continue
-        parts = item["object_key"].split("/")
-        symbol = parts[5]
-        by_symbol.setdefault(symbol, []).append(item)
+        identity = validate_archive_object_key(item.get("object_key"))
+        by_symbol.setdefault(identity.symbol, []).append(item)
     symbols = sorted(by_symbol)[: args.symbol_limit]
 
     quality: list[dict] = []
     for symbol in symbols:
         frames = []
         for item in sorted(by_symbol[symbol], key=lambda row: row["object_key"]):
-            frame = read_kline_zip(item["local_path"], symbol)
-            frame["source_key"] = item["object_key"]
-            frame["source_sha256"] = item["computed_sha256"]
+            verified = validate_manifest_archive(item, raw_root)
+            frame = read_kline_zip(verified.local_path, verified.identity.symbol)
+            frame["source_key"] = verified.identity.object_key
+            frame["source_sha256"] = verified.sha256
             frames.append(frame)
         hourly = pd.concat(frames, ignore_index=True).sort_values("open_time")
         if hourly.duplicated(["symbol", "open_time"]).any():
@@ -63,8 +75,9 @@ def main() -> None:
                 "last_close_time": hourly["close_time"].max().isoformat(),
             }
         )
-    target = root / "reports" / "full_processing_quality.json"
-    target.write_text(json.dumps(quality, indent=2), encoding="utf-8")
+    run_id = collision_resistant_run_id()
+    target = root / "reports" / f"full_processing_quality_{run_id}.json"
+    write_json_exclusive(target, quality)
     print(f"Processed {len(quality):,} symbols independently; quality report: {target}")
 
 

@@ -10,16 +10,20 @@ from pathlib import Path
 
 from alt_hot_scanner.data.binance_public import (
     ArchiveAcquisitionError,
+    collision_resistant_run_id,
     download_verified_archive,
+    validate_archive_object_key,
+    write_json_exclusive,
 )
 
 
 def key_fields(object_key: str) -> dict[str, str]:
-    parts = object_key.split("/")
-    symbol = parts[5]
-    interval = parts[6]
-    period = parts[-1].removeprefix(f"{symbol}-{interval}-").removesuffix(".zip")
-    return {"symbol": symbol, "interval": interval, "period": period}
+    identity = validate_archive_object_key(object_key)
+    return {
+        "symbol": identity.symbol,
+        "interval": identity.interval,
+        "period": identity.period,
+    }
 
 
 def failure_attempt(object_key: str, exc: Exception) -> dict:
@@ -33,6 +37,8 @@ def failure_attempt(object_key: str, exc: Exception) -> dict:
         status_code = exc.status_code
         published = exc.published_sha256
         computed = exc.computed_sha256
+        byte_count = exc.byte_count
+        local_path = exc.local_path
     else:
         status = "failed"
         failure_stage = "unclassified_local_or_request_failure"
@@ -40,6 +46,8 @@ def failure_attempt(object_key: str, exc: Exception) -> dict:
         status_code = getattr(exc, "code", None)
         published = None
         computed = None
+        byte_count = None
+        local_path = None
     return {
         "object_key": object_key,
         "url": f"https://data.binance.vision/{object_key}",
@@ -49,8 +57,8 @@ def failure_attempt(object_key: str, exc: Exception) -> dict:
         "retrieved_at": datetime.now(UTC).isoformat(),
         "published_sha256": published,
         "computed_sha256": computed,
-        "byte_count": None,
-        "local_path": None,
+        "byte_count": byte_count,
+        "local_path": local_path,
         "checksum_verified": False,
         "payload_source": None,
         "http_result": status_code or "request_or_validation_failed",
@@ -62,7 +70,7 @@ def failure_attempt(object_key: str, exc: Exception) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Resumable checksum-verified archive downloader")
-    parser.add_argument("--plan", default="reports/full_download_plan.json")
+    parser.add_argument("--plan", required=True, help="Exact prepared plan path")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--limit", type=int, help="Optional bounded smoke-run object count")
     parser.add_argument(
@@ -80,7 +88,12 @@ def main() -> None:
     root = Path(__file__).resolve().parents[1]
     plan_path = root / args.plan
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    objects = plan["objects"][: args.limit]
+    if type(plan) is not dict or type(plan.get("objects")) is not list:
+        raise ValueError("Plan must contain an objects list")
+    if args.limit is not None and args.limit < 0:
+        raise ValueError("--limit must not be negative")
+    selected = plan["objects"][: args.limit]
+    objects = [validate_archive_object_key(key).object_key for key in selected]
     print(
         f"Validated plan with {len(objects):,} selected objects ({len(plan['objects']):,} total)."
     )
@@ -113,10 +126,10 @@ def main() -> None:
             except (ArchiveAcquisitionError, OSError, ValueError, urllib.error.URLError) as exc:
                 attempts.append(failure_attempt(key, exc))
 
-    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    run_id = collision_resistant_run_id()
     manifest_path = raw_root / "manifests" / f"full_download_attempts_{run_id}.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(attempts, indent=2), encoding="utf-8")
+    attempts.sort(key=lambda item: item["object_key"])
+    write_json_exclusive(manifest_path, attempts)
     verified = sum(attempt["status"] == "verified" for attempt in attempts)
     missing = sum(attempt["status"] == "missing" for attempt in attempts)
     failures = sum(attempt["status"] == "failed" for attempt in attempts)

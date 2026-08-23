@@ -90,3 +90,33 @@ def test_btc_benchmark_and_eth_tagging() -> None:
     result = apply_point_in_time_eligibility(bars, contracts)
     assert bool(result.loc[result["symbol"].eq("BTCUSDT"), "is_benchmark"].iloc[0])
     assert bool(result.loc[result["symbol"].eq("ETHUSDT"), "is_eth"].iloc[0])
+
+
+def test_mixed_iso_precision_in_lifecycle_anchors_is_supported() -> None:
+    bars = pd.concat(
+        [
+            make_4h("AAAUSDT", 1, "2023-03-01T00:00:00Z"),
+            make_4h("BBBUSDT", 1, "2023-03-01T00:00:00Z"),
+        ],
+        ignore_index=True,
+    )
+    contracts = pd.DataFrame(
+        {
+            "symbol": ["AAAUSDT", "BBBUSDT"],
+            "eligibility_age_anchor_at": [
+                "2023-01-01T00:00:00+00:00",
+                "2023-01-01T00:00:00.123000+00:00",
+            ],
+            "eligibility_age_anchor_basis": [
+                "exact_official_original_launch",
+                "first_observed_binance_futures_trade",
+            ],
+            "delisting_announcement_published_at": [None, None],
+            "scope_classification_status": ["resolved", "resolved"],
+            "scope_disposition": [
+                "in_scope_crypto_perpetual",
+                "in_scope_crypto_perpetual",
+            ],
+        }
+    )
+    assert apply_point_in_time_eligibility(bars, contracts)["is_eligible"].all()

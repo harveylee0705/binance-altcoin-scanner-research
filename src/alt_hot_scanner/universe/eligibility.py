@@ -41,8 +41,10 @@ def apply_point_in_time_eligibility(
         raise ValueError("Contract metadata must have one row per symbol")
 
     result = bars.merge(contracts, on="symbol", how="left", validate="many_to_one")
-    signal_time = pd.to_datetime(result[timestamp_col], utc=True)
-    age_anchor = pd.to_datetime(result["eligibility_age_anchor_at"], utc=True)
+    signal_time = pd.to_datetime(result[timestamp_col], utc=True, format="mixed")
+    age_anchor = pd.to_datetime(
+        result["eligibility_age_anchor_at"], utc=True, format="mixed"
+    )
     age = signal_time - age_anchor
     result["contract_age_days"] = age.dt.total_seconds() / 86_400
     has_listing_evidence = age_anchor.notna() & result["eligibility_age_anchor_basis"].isin(
@@ -53,7 +55,9 @@ def apply_point_in_time_eligibility(
         ]
     )
     old_enough = age >= pd.Timedelta(days=minimum_age_days)
-    announced = pd.to_datetime(result["delisting_announcement_published_at"], utc=True)
+    announced = pd.to_datetime(
+        result["delisting_announcement_published_at"], utc=True, format="mixed"
+    )
     before_announcement = announced.isna() | signal_time.lt(announced)
     has_market_data = result["close"].notna()
     scope_resolved = result["scope_classification_status"].ne("unresolved")

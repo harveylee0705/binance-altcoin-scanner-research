@@ -60,13 +60,18 @@ performance by score decile. Re-running skips matching verified raw files.
 To prepare a scalable download manifest without downloading full history:
 
 ```powershell
-.venv\Scripts\python scripts/prepare_full_manifest.py --config config/research_v0_1.yaml
+.venv\Scripts\python scripts/prepare_full_manifest.py `
+  --config config/research_v0_1.yaml `
+  --bundle reports/lifecycle/<RUN_ID>/lifecycle_bundle.json `
+  --approval <EXPLICIT_REVIEWED_APPROVAL_PIN>.json
 ```
 
-This consumes the newest content-bound lifecycle bundle and emits only monthly 1H ZIP object keys
+This requires an exact content-bound lifecycle bundle and an exact independent-review approval pin;
+there is no implicit newest-bundle selection. It emits only monthly 1H ZIP object keys
 actually observed in the preserved, fully paginated archive index. It refuses to create a plan while
 any potentially in-scope lifecycle or classification blocker remains unresolved. The plan embeds the
-bundle identity, exact artifact hashes, config digest, readiness state, and its own content digest.
+bundle identity, approval identity, exact artifact hashes, config digest, readiness state, and its
+own content digest. The lifecycle build does not create a real approval pin.
 
 The prepared full-data path is resumable and deliberately requires an execution switch:
 

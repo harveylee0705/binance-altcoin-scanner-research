@@ -15,13 +15,16 @@ catalog 161 (Delisting), stores raw JSON responses immutably with SHA-256, and c
 exact canonical symbols. This is not part of the documented Futures market-data API, so its coverage
 and reproducibility are audited on every run.
 
-Where exact evidence is unavailable:
+Where exact launch evidence is unavailable:
 
 - retain delisted archives and last valid/trading timestamps;
 - never fabricate `delisting_announcement_published_at`;
 - set that field null with provenance;
-- fail closed for missing verified trading starts;
-- permit a null delisting announcement only as an explicitly disclosed unresolved limitation.
+- use only the earliest checksum-verified official Futures trade as a later, conservative age
+  boundary and report the resulting early-history coverage loss;
+- never call that observed boundary an exact listing time;
+- after a comprehensive official search, permit a null delisting announcement as the explicit
+  `official_search_completed_no_reliable_announcement_timestamp` state.
 
 Search engines and third-party pages may locate an official article but never become the stored
 authority. Multiple official articles for one symbol/event are marked ambiguous instead of silently
@@ -59,19 +62,21 @@ horizon, and a later HOT row after a gap starts a new episode.
 
 ## Listing and delisting boundaries
 
-Exact `official_trading_start_at` from accepted official announcement evidence is the eligibility
-boundary. Current `exchangeInfo.onboardDate` is retained separately and discrepancies are visible;
-it is not silently substituted for an unresolved official start. Archive bounds and first valid data
-are observed market-data evidence only. The 30-day minimum age is fixed and does not change based on
-outcomes. `deliveryDate` may be a far-future sentinel for active perpetuals and must not be interpreted
-as an actual delisting. Current active/delisted status never removes historical rows.
+The separate `eligibility_age_anchor_at` is either an exact official original launch, a conservative
+checksum-verified first Futures trade, or an explicitly adjudicated legacy boundary. Current
+`exchangeInfo.onboardDate` is retained separately and discrepancies are warnings; it is not silently
+renamed as an exact launch. The 30-day minimum age is fixed and does not change based on outcomes.
+`deliveryDate` may be a far-future sentinel for active perpetuals and must not be interpreted as an
+actual delisting. Current active/delisted status never removes historical rows.
 
 ## Contract classification
 
 Filtering only by a `USDT` suffix is insufficient. Full processing must require quote/margin assets
 and `PERPETUAL`, exclude stablecoin and leveraged-token underlyings, and reject TradFi/non-crypto
-products based on captured metadata. Historical archive symbols missing authoritative classification
-remain quarantined rather than guessed into the universe.
+products based on captured metadata. Classification uses a completed finite-universe audit bound to
+the exact archive candidate-set hash. Positive stablecoin, leveraged-token, TradFi, index, composite,
+and delivery exclusions retain provenance. Only candidates in that exact audited set may receive
+reviewed negative classifications; a changed candidate set invalidates completeness automatically.
 
 The reusable pipeline enforces this classification centrally. Stablecoin admission depends on the
 captured per-contract subtype evidence, not whether a base appears in the legacy configuration list.
@@ -81,11 +86,11 @@ assets such as JUP and SYRUP.
 Missing/null/empty/malformed underlying-subtype evidence or blank identity/provenance fields are
 quarantined. This is intentionally stricter than treating absence of a leveraged tag as proof of a
 normal crypto underlying.
-All classification-bearing symbols, assets, product types, subtype labels, and provenance values
-pass one canonical identity boundary before scope decisions. Wrong types, padding, control
-characters, non-ASCII/confusable encodings, noncanonical casing for Binance tokens, and inconsistent
-symbol/base/quote identities are quarantined rather than trimmed, coerced, or recased. Stablecoin,
-BTC, and ETH decisions therefore operate only on validated canonical identities.
+All classification-bearing identities pass a canonical semantic boundary before scope decisions.
+ASCII Binance tokens retain their strict grammar. Genuine non-ASCII exchange identities retain exact
+NFC text while local paths use collision-resistant ASCII components; traversal characters and
+control characters remain prohibited. Stablecoin, BTC, and ETH decisions therefore operate only on
+validated identities.
 
 ## Statistical dependence and inference
 

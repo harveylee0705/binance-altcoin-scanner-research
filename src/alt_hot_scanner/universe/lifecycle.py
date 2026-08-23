@@ -7,10 +7,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from alt_hot_scanner.identity import require_binance_token
+from alt_hot_scanner.identity import require_archive_symbol_identity
 
-CATALOG_SCHEMA_VERSION = "binance-usdm-lifecycle-v2"
-PARSER_VERSION = "lifecycle-catalog-v2"
+CATALOG_SCHEMA_VERSION = "binance-usdm-lifecycle-v3"
+PARSER_VERSION = "lifecycle-catalog-v3"
 
 CATALOG_COLUMNS = [
     "catalog_schema_version",
@@ -35,8 +35,22 @@ CATALOG_COLUMNS = [
     "is_eth",
     "scope_classification_status",
     "scope_classification_provenance",
+    "scope_disposition",
     "listing_announcement_published_at",
+    "exact_official_trading_start_at",
     "official_trading_start_at",
+    "first_observed_trade_at",
+    "first_observed_trade_archive_key",
+    "first_observed_trade_published_sha256",
+    "first_observed_trade_computed_sha256",
+    "first_observed_trade_raw_path",
+    "first_observed_trade_retrieved_at",
+    "first_observed_trade_parser_version",
+    "first_observed_trade_evidence_status",
+    "eligibility_age_anchor_at",
+    "eligibility_age_anchor_basis",
+    "age_anchor_conflict_status",
+    "conservative_anchor_coverage_loss_start_at",
     "exchange_info_onboard_at",
     "first_archive_month",
     "first_valid_kline_at",
@@ -96,6 +110,7 @@ def _null_record(symbol: str, created_at: pd.Timestamp) -> dict[str, Any]:
         "is_benchmark_btc": symbol == "BTCUSDT",
         "is_eth": symbol == "ETHUSDT",
         "scope_classification_status": "unresolved",
+        "scope_disposition": "unresolved",
         "listing_evidence_status": "unresolved",
         "delisting_evidence_status": "unresolved",
         "stablecoin_evidence_status": "unresolved",
@@ -104,6 +119,8 @@ def _null_record(symbol: str, created_at: pd.Timestamp) -> dict[str, Any]:
         "leveraged_conflict_status": "none",
         "scope_classification_complete": False,
         "listing_start_complete": False,
+        "eligibility_age_anchor_basis": "unresolved",
+        "age_anchor_conflict_status": "none",
         "delisting_evidence_state": "not_investigated",
         "onboard_start_discrepancy_status": "not_comparable",
         "historical_inclusion_readiness": "blocked",
@@ -138,6 +155,8 @@ def build_lifecycle_catalog(
     *,
     created_at: pd.Timestamp | None = None,
     announcement_search_completed: bool | None = None,
+    first_observed_trades: pd.DataFrame | None = None,
+    scope_registry_records: list[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """Merge distinct evidence tiers without promoting observed bounds into exact events."""
     required_archive = {
@@ -168,9 +187,18 @@ def build_lifecycle_catalog(
         if not exchange_info_records.empty
         else pd.DataFrame()
     )
+    trades = first_observed_trades if first_observed_trades is not None else pd.DataFrame()
+    if not trades.empty and trades["symbol"].duplicated().any():
+        raise ValueError("First-observed-trade evidence must have one row per symbol")
+    trades_by_symbol = trades.set_index("symbol", drop=False) if not trades.empty else pd.DataFrame()
+    scope_by_symbol = {
+        row.get("contract_identity"): row for row in (scope_registry_records or [])
+    }
+    if len(scope_by_symbol) != len(scope_registry_records or []):
+        raise ValueError("Scope registry records contain duplicate identities")
     records: list[dict[str, Any]] = []
     for archive_row in archive_observations.sort_values("symbol").to_dict("records"):
-        symbol = require_binance_token(archive_row["symbol"], "archive symbol")
+        symbol = require_archive_symbol_identity(archive_row["symbol"], "archive symbol")
         record = _null_record(symbol, created)
         record.update(
             {
@@ -223,12 +251,46 @@ def build_lifecycle_catalog(
             record["scope_classification_provenance"] = current.get(
                 "scope_classification_provenance"
             )
+            if not scope_registry_records and record["scope_classification_status"] != "unresolved":
+                record["scope_disposition"] = (
+                    "benchmark_only"
+                    if symbol == "BTCUSDT"
+                    else "in_scope_crypto_perpetual"
+                    if bool(record["is_crypto_underlying"])
+                    and not bool(record["is_stablecoin_underlying"])
+                    and not bool(record["is_leveraged_token"])
+                    else "excluded"
+                )
+
+        scope = scope_by_symbol.get(symbol)
+        if scope is not None:
+            record.update(
+                {
+                    "base_asset": scope.get("base_asset") or record.get("base_asset"),
+                    "quote_asset": scope.get("quote_asset") or record.get("quote_asset"),
+                    "is_crypto_underlying": scope.get("is_crypto_underlying"),
+                    "is_stablecoin_underlying": scope.get("is_stablecoin_underlying"),
+                    "is_leveraged_token": scope.get("is_leveraged_token"),
+                    "stablecoin_evidence_status": scope.get("stablecoin_evidence_status"),
+                    "leveraged_evidence_status": scope.get("leveraged_evidence_status"),
+                    "scope_classification_status": (
+                        "resolved_reviewed_finite_universe"
+                        if scope.get("scope_audit_status") == "complete"
+                        else "unresolved"
+                    ),
+                    "scope_classification_provenance": (
+                        "candidate_set_bound_historical_scope_registry"
+                    ),
+                    "scope_disposition": scope.get("product_scope"),
+                }
+            )
 
         listing = _accepted_event(evidence, symbol, "listing")
         if listing is not None:
             record.update(
                 {
                     "listing_announcement_published_at": listing["article_published_at"],
+                    "exact_official_trading_start_at": listing["official_event_at"],
                     "official_trading_start_at": listing["official_event_at"],
                     "listing_evidence_status": listing["event_time_evidence_status"],
                     "listing_source_type": "official_binance_structured_announcement",
@@ -240,15 +302,21 @@ def build_lifecycle_catalog(
                     "listing_parser_version": listing["parser_version"],
                 }
             )
-            # An exact match to an official New Cryptocurrency Listing article proves
-            # crypto identity, but not stablecoin or leveraged-token absence.
-            if record["is_crypto_underlying"] is None:
-                record["is_crypto_underlying"] = True
-                record["scope_classification_provenance"] = (
-                    "official_binance_new_cryptocurrency_listing_article;"
-                    "stablecoin_and_leveraged_status_unresolved"
-                )
 
+        if not trades_by_symbol.empty and symbol in trades_by_symbol.index:
+            trade = trades_by_symbol.loc[symbol]
+            record.update(
+                {
+                    "first_observed_trade_at": trade["earliest_trade_timestamp"],
+                    "first_observed_trade_archive_key": trade["archive_object_key"],
+                    "first_observed_trade_published_sha256": trade["published_sha256"],
+                    "first_observed_trade_computed_sha256": trade["computed_sha256"],
+                    "first_observed_trade_raw_path": trade["raw_path"],
+                    "first_observed_trade_retrieved_at": trade["original_retrieval_timestamp"],
+                    "first_observed_trade_parser_version": trade["parser_version"],
+                    "first_observed_trade_evidence_status": trade["evidence_status"],
+                }
+            )
         delisting = _accepted_event(evidence, symbol, "delisting")
         if delisting is not None:
             record.update(
@@ -268,27 +336,66 @@ def build_lifecycle_catalog(
                 }
             )
 
-        classification_complete = (
-            record["scope_classification_status"] != "unresolved"
-            and isinstance(record["is_stablecoin_underlying"], (bool, np.bool_))
-            and isinstance(record["is_leveraged_token"], (bool, np.bool_))
-            and record["stablecoin_conflict_status"] != "conflict"
-            and record["leveraged_conflict_status"] != "conflict"
+        scope_is_excluded = str(record["scope_disposition"]).startswith("excluded")
+        classification_complete = record["scope_classification_status"] != "unresolved" and (
+            scope_is_excluded
+            or (
+                isinstance(record["is_stablecoin_underlying"], (bool, np.bool_))
+                and isinstance(record["is_leveraged_token"], (bool, np.bool_))
+                and record["stablecoin_conflict_status"] != "conflict"
+                and record["leveraged_conflict_status"] != "conflict"
+            )
         )
-        listing_complete = record["official_trading_start_at"] is not None
+        exact_start = record["exact_official_trading_start_at"]
+        observed_start = record["first_observed_trade_at"]
+        anchor = None
+        anchor_basis = "unresolved"
+        anchor_conflict = "none"
+        if exact_start is not None and observed_start is not None and pd.Timestamp(
+            observed_start
+        ) < pd.Timestamp(exact_start):
+            anchor_conflict = "first_observed_trade_precedes_claimed_exact_launch"
+        elif exact_start is not None:
+            anchor = exact_start
+            anchor_basis = "exact_official_original_launch"
+        elif observed_start is not None:
+            observed_timestamp = pd.Timestamp(observed_start)
+            if observed_timestamp <= pd.Timestamp("2019-12-02T00:00:00Z"):
+                anchor = observed_start
+                anchor_basis = "legacy_pre_research_start_adjudicated"
+            elif observed_timestamp < pd.Timestamp("2020-01-01T00:00:00Z"):
+                # The verified trade explicitly adjudicates that the contract was not yet
+                # 30 days old at research start; it becomes eligible 30 days after this
+                # conservative boundary rather than being guessed older.
+                anchor = observed_start
+                anchor_basis = "first_observed_binance_futures_trade"
+            else:
+                anchor = observed_start
+                anchor_basis = "first_observed_binance_futures_trade"
+        listing_complete = anchor is not None and anchor_conflict == "none"
         is_current = record["present_in_current_exchange_info"] is True
         status = record["latest_known_status"]
         is_trading = is_current and status == "TRADING"
-        needs_delisting = is_current and status != "TRADING"
         exact_delisting = record["delisting_announcement_published_at"] is not None
-        if exact_delisting:
+        matching_delisting_rows = (
+            evidence.loc[
+                evidence["symbol"].eq(symbol) & evidence["event_type"].eq("delisting")
+            ]
+            if not evidence.empty
+            else pd.DataFrame()
+        )
+        has_delisting_conflict = (
+            not matching_delisting_rows.empty
+            and matching_delisting_rows["match_status"].astype(str).str.contains("ambiguous").any()
+        ) or (exact_delisting and is_trading)
+        if has_delisting_conflict:
+            delisting_state = "conflicting_evidence"
+        elif exact_delisting:
             delisting_state = "exact_applicable_announcement_publication"
         elif is_trading:
             delisting_state = "not_applicable_currently_trading"
-        elif needs_delisting:
-            delisting_state = "unresolved_current_non_trading_without_announcement"
         elif search_completed:
-            delisting_state = "searched_official_sources_no_exact_announcement_found"
+            delisting_state = "official_search_completed_no_reliable_announcement_timestamp"
         else:
             delisting_state = "not_investigated"
         onboard = record["exchange_info_onboard_at"]
@@ -305,27 +412,43 @@ def build_lifecycle_catalog(
         else:
             difference = None
             discrepancy_status = "not_comparable"
-        delisting_ready = is_trading or exact_delisting or (
-            not is_current
-            and delisting_state == "searched_official_sources_no_exact_announcement_found"
+        delisting_ready = not has_delisting_conflict and (
+            is_trading
+            or exact_delisting
+            or delisting_state
+            == "official_search_completed_no_reliable_announcement_timestamp"
         )
+        in_research_scope = record["scope_disposition"] in {
+            "in_scope_crypto_perpetual",
+            "benchmark_only",
+        }
         ready = (
             classification_complete
+            and in_research_scope
             and listing_complete
             and delisting_ready
-            and discrepancy_status != "unresolved_material_discrepancy"
         )
         record.update(
             {
                 "scope_classification_complete": classification_complete,
                 "listing_start_complete": listing_complete,
+                "eligibility_age_anchor_at": anchor,
+                "eligibility_age_anchor_basis": anchor_basis,
+                "age_anchor_conflict_status": anchor_conflict,
+                "conservative_anchor_coverage_loss_start_at": (
+                    record["first_archive_month"]
+                    if anchor_basis == "first_observed_binance_futures_trade"
+                    else None
+                ),
                 "delisting_evidence_state": delisting_state,
                 "current_status_warning": (
                     None if is_trading else f"current_status_{status or 'archive_only'}"
                 ),
                 "onboard_start_discrepancy_seconds": difference,
                 "onboard_start_discrepancy_status": discrepancy_status,
-                "historical_inclusion_readiness": "ready" if ready else "blocked",
+                "historical_inclusion_readiness": (
+                    "ready" if ready else "excluded" if classification_complete and not in_research_scope else "blocked"
+                ),
             }
         )
 
@@ -342,16 +465,30 @@ def catalog_coverage(catalog: pd.DataFrame) -> dict[str, Any]:
     usdt = catalog["quote_asset"].eq("USDT") | catalog["symbol"].str.endswith("USDT")
     current = catalog["present_in_current_exchange_info"].eq(True)
     resolved = catalog["scope_classification_complete"].eq(True)
-    exact_listing = catalog["official_trading_start_at"].notna()
+    exact_listing = catalog["exact_official_trading_start_at"].notna()
+    observed_anchor = catalog["eligibility_age_anchor_basis"].eq(
+        "first_observed_binance_futures_trade"
+    )
+    legacy_anchor = catalog["eligibility_age_anchor_basis"].eq(
+        "legacy_pre_research_start_adjudicated"
+    )
+    unresolved_anchor = catalog["eligibility_age_anchor_basis"].eq("unresolved")
     exact_delist_publication = catalog["delisting_announcement_published_at"].notna()
     exact_last_trading = catalog["official_last_trading_at"].notna()
-    lifecycle_unresolved = usdt & catalog["historical_inclusion_readiness"].ne("ready")
+    potentially_in_scope = usdt & catalog["scope_disposition"].isin(
+        ["in_scope_crypto_perpetual", "benchmark_only", "unresolved"]
+    )
+    lifecycle_unresolved = potentially_in_scope & catalog[
+        "historical_inclusion_readiness"
+    ].eq("blocked")
     quarantined = lifecycle_unresolved
 
     def segment(mask: pd.Series) -> dict[str, int]:
         return {
             "symbols": int(mask.sum()),
             "exact_official_trading_start": int((mask & exact_listing).sum()),
+            "first_observed_trade_anchor": int((mask & observed_anchor).sum()),
+            "legacy_adjudicated_anchor": int((mask & legacy_anchor).sum()),
             "exact_delisting_announcement": int((mask & exact_delist_publication).sum()),
             "resolved_scope_classification": int((mask & resolved).sum()),
             "quarantined": int((mask & quarantined).sum()),
@@ -367,6 +504,9 @@ def catalog_coverage(catalog: pd.DataFrame) -> dict[str, Any]:
         "current_snapshot_symbols": int((usdt & current).sum()),
         "archive_only_symbols": int(archive_only.sum()),
         "exact_official_trading_start_coverage": int((usdt & exact_listing).sum()),
+        "first_observed_trade_anchor_coverage": int((usdt & observed_anchor).sum()),
+        "legacy_pre_research_start_adjudicated_coverage": int((usdt & legacy_anchor).sum()),
+        "unresolved_age_anchor_coverage": int((potentially_in_scope & unresolved_anchor).sum()),
         "exchange_info_onboard_coverage": int(
             (usdt & catalog["exchange_info_onboard_at"].notna()).sum()
         ),
@@ -379,11 +519,15 @@ def catalog_coverage(catalog: pd.DataFrame) -> dict[str, Any]:
         "unresolved_lifecycle_cases": int(lifecycle_unresolved.sum()),
         "currently_quarantined": int(quarantined.sum()),
         "historical_inclusion_ready": int(
-            (usdt & catalog["historical_inclusion_readiness"].eq("ready")).sum()
+            (potentially_in_scope & catalog["historical_inclusion_readiness"].eq("ready")).sum()
         ),
         "authorization_ready": not bool(quarantined.any()),
         "unresolved_categories": {
             "usdt_missing_exact_official_trading_start": int((usdt & ~exact_listing).sum()),
+            "unresolved_age_anchor": int((potentially_in_scope & unresolved_anchor).sum()),
+            "age_anchor_conflicts": int(
+                (potentially_in_scope & catalog["age_anchor_conflict_status"].ne("none")).sum()
+            ),
             "usdt_missing_scope_classification": int((usdt & ~resolved).sum()),
             "matched_listing_article_but_event_time_unresolved": int(
                 (catalog["listing_article_id"].notna() & ~exact_listing).sum()
@@ -394,6 +538,20 @@ def catalog_coverage(catalog: pd.DataFrame) -> dict[str, Any]:
             ),
             "current_non_trading_without_exact_delisting_announcement": int(
                 (retained_non_trading & ~exact_delist_publication).sum()
+            ),
+            "delisting_search_completed_no_reliable_timestamp": int(
+                (
+                    potentially_in_scope
+                    & catalog["delisting_evidence_state"].eq(
+                        "official_search_completed_no_reliable_announcement_timestamp"
+                    )
+                ).sum()
+            ),
+            "delisting_search_incomplete": int(
+                (potentially_in_scope & catalog["delisting_evidence_state"].eq("not_investigated")).sum()
+            ),
+            "delisting_conflicts": int(
+                (potentially_in_scope & catalog["delisting_evidence_state"].eq("conflicting_evidence")).sum()
             ),
             "stablecoin_classification_unresolved": int(
                 (usdt & catalog["is_stablecoin_underlying"].isna()).sum()

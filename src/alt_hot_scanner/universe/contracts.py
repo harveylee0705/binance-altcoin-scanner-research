@@ -7,6 +7,7 @@ import pandas as pd
 
 from alt_hot_scanner.identity import (
     IdentityValidationError,
+    require_archive_symbol_identity,
     require_binance_token,
     require_canonical_text,
     require_identity_sequence,
@@ -83,8 +84,8 @@ def records_from_exchange_info(
         delivery_ms = item.get("deliveryDate")
         raw_subtype = item.get("underlyingSubType")
         try:
-            symbol = require_binance_token(item.get("symbol"), "symbol")
-            base_asset = require_binance_token(item.get("baseAsset"), "baseAsset")
+            symbol = require_archive_symbol_identity(item.get("symbol"), "symbol")
+            base_asset = require_archive_symbol_identity(item.get("baseAsset"), "baseAsset")
             quote_asset = require_binance_token(item.get("quoteAsset"), "quoteAsset")
             margin_asset = require_binance_token(item.get("marginAsset"), "marginAsset")
             contract_type = require_binance_token(item.get("contractType"), "contractType")
@@ -263,8 +264,8 @@ def filter_instrument_scope(
 
     def valid_row(row: pd.Series) -> bool:
         try:
-            symbol = require_binance_token(row["symbol"], "symbol")
-            base = require_binance_token(row["base_asset"], "base_asset")
+            symbol = require_archive_symbol_identity(row["symbol"], "symbol")
+            base = require_archive_symbol_identity(row["base_asset"], "base_asset")
             quote = require_binance_token(row["quote_asset"], "quote_asset")
             require_binance_token(row["margin_asset"], "margin_asset")
             require_binance_token(row["contract_type"], "contract_type")

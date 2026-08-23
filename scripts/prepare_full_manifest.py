@@ -15,7 +15,9 @@ from alt_hot_scanner.data.binance_public import (
 from alt_hot_scanner.universe.authorization import (
     PLAN_SCHEMA_VERSION,
     build_plan_integrity,
+    verify_approval_pin,
     verify_lifecycle_bundle,
+    verify_runtime_matches_approved_commit,
 )
 from alt_hot_scanner.universe.contracts import filter_instrument_scope
 from alt_hot_scanner.utils.config import load_config
@@ -35,17 +37,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-month", help="YYYY-MM; default is the current fully ended month")
     parser.add_argument(
         "--bundle",
-        help="Content-bound lifecycle bundle; defaults to the newest local bundle",
+        required=True,
+        help="Exact content-bound lifecycle bundle; implicit newest-bundle selection is prohibited",
     )
+    parser.add_argument("--approval", required=True, help="Exact reviewed lifecycle approval pin")
     return parser.parse_args()
 
 
 def prepare_plan_payload(
     bundle_path: Path,
+    approval_path: Path,
     *,
     end_month: pd.Period,
 ) -> dict:
     verified = verify_lifecycle_bundle(bundle_path)
+    verified_approval = verify_approval_pin(approval_path, verified)
     if not verified["readiness"]["authorization_ready"]:
         raise RuntimeError("Lifecycle/integrity gate is incomplete; do not prepare full history")
     config = load_config(verified["config_path"])
@@ -86,6 +92,8 @@ def prepare_plan_payload(
         "source": config["data"]["archive_index_url"],
         "lifecycle_bundle": str(Path(bundle_path).resolve()),
         "lifecycle_bundle_id": bundle["bundle_id"],
+        "lifecycle_approval": str(Path(approval_path).resolve()),
+        "lifecycle_approval_id": verified_approval["approval"]["approval_id"],
         "artifact_hashes": {
             name: descriptor["sha256"] for name, descriptor in bundle["artifacts"].items()
         },
@@ -105,19 +113,18 @@ def main() -> None:
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
     requested_config = (root / args.config).resolve()
-    if args.bundle:
-        bundle_path = Path(args.bundle).resolve()
-    else:
-        candidates = sorted((root / "reports" / "lifecycle").glob("*/lifecycle_bundle.json"))
-        if not candidates:
-            raise RuntimeError("Build and approve a lifecycle bundle before preparing full history")
-        bundle_path = candidates[-1]
+    bundle_path = Path(args.bundle).resolve()
+    approval_path = Path(args.approval).resolve()
     verified = verify_lifecycle_bundle(bundle_path)
+    verified_approval = verify_approval_pin(approval_path, verified)
+    verify_runtime_matches_approved_commit(
+        root, verified_approval["approval"]["lifecycle_evidence_code_commit"]
+    )
     if verified["config_path"] != requested_config:
         raise RuntimeError("Requested config is not the exact config bound into the lifecycle bundle")
     now = pd.Timestamp.now(tz="UTC")
     end = pd.Period(args.end_month, freq="M") if args.end_month else last_completed_month(now)
-    payload = prepare_plan_payload(bundle_path, end_month=end)
+    payload = prepare_plan_payload(bundle_path, approval_path, end_month=end)
     run_id = collision_resistant_run_id()
     target = root / "reports" / f"full_download_plan_{run_id}.json"
     write_json_exclusive(target, payload)

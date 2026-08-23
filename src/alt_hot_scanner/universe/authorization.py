@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from alt_hot_scanner.data.binance_public import validate_archive_object_key
+from alt_hot_scanner.data.binance_public import (
+    parse_earliest_trade_timestamp,
+    validate_archive_object_key,
+)
 from alt_hot_scanner.universe.contracts import filter_instrument_scope
-from alt_hot_scanner.universe.lifecycle import CATALOG_SCHEMA_VERSION, catalog_coverage
+from alt_hot_scanner.universe.lifecycle import CATALOG_SCHEMA_VERSION
+from alt_hot_scanner.universe.scope_registry import verify_scope_registry
 from alt_hot_scanner.utils.config import load_config
 
-BUNDLE_SCHEMA_VERSION = "lifecycle-authorization-bundle-v1"
-PLAN_SCHEMA_VERSION = "full-history-download-plan-v2"
+BUNDLE_SCHEMA_VERSION = "lifecycle-authorization-bundle-v2"
+APPROVAL_SCHEMA_VERSION = "lifecycle-approval-pin-v1"
+PLAN_SCHEMA_VERSION = "full-history-download-plan-v3"
 PLAN_FIELDS = {
     "schema_version",
     "created_at",
@@ -21,6 +27,8 @@ PLAN_FIELDS = {
     "source",
     "lifecycle_bundle",
     "lifecycle_bundle_id",
+    "lifecycle_approval",
+    "lifecycle_approval_id",
     "artifact_hashes",
     "config_sha256",
     "readiness",
@@ -50,20 +58,40 @@ def content_identity(value: dict[str, Any]) -> str:
 
 
 def catalog_readiness(catalog: pd.DataFrame, noncanonical_candidates: list[str]) -> dict[str, Any]:
-    coverage = catalog_coverage(catalog)
+    in_scope = (
+        catalog["scope_disposition"].isin(["in_scope_crypto_perpetual", "benchmark_only"])
+        if "scope_disposition" in catalog.columns
+        else catalog["symbol"].str.endswith("USDT")
+    )
+    derived_ready = (
+        in_scope
+        & catalog["scope_classification_complete"].eq(True)
+        & catalog["eligibility_age_anchor_at"].notna()
+        & catalog["eligibility_age_anchor_basis"].ne("unresolved")
+        & catalog["age_anchor_conflict_status"].eq("none")
+        & catalog["delisting_evidence_state"].isin(
+            [
+                "not_applicable_currently_trading",
+                "exact_applicable_announcement_publication",
+                "official_search_completed_no_reliable_announcement_timestamp",
+            ]
+        )
+    )
+    supplied_ready = catalog["historical_inclusion_readiness"].eq("ready")
+    if not supplied_ready.equals(derived_ready):
+        raise ValueError("Derived catalog readiness disagrees with primitive lifecycle fields")
     row_blockers = sorted(
         catalog.loc[
-            catalog["symbol"].str.endswith("USDT")
-            & catalog["historical_inclusion_readiness"].ne("ready"),
+            in_scope & ~derived_ready,
             "symbol",
         ].tolist()
     )
-    external = sorted(symbol for symbol in noncanonical_candidates if symbol.endswith("USDT"))
+    external = sorted(noncanonical_candidates)
     return {
         "schema_version": "lifecycle-readiness-v1",
         "catalog_schema_version": CATALOG_SCHEMA_VERSION,
-        "candidate_rows": coverage["total_usdt_candidate_symbols"],
-        "ready_rows": coverage["historical_inclusion_ready"],
+        "candidate_rows": int(in_scope.sum()),
+        "ready_rows": int(derived_ready.sum()),
         "catalog_blocker_count": len(row_blockers),
         "catalog_blocker_symbols": row_blockers,
         "noncanonical_blocker_count": len(external),
@@ -99,11 +127,79 @@ def build_bundle_payload(
     return {**core, "bundle_id": content_identity(core)}
 
 
+def verify_approval_pin(
+    approval_path: str | Path, verified_bundle: dict[str, Any]
+) -> dict[str, Any]:
+    path = Path(approval_path).resolve(strict=True)
+    approval = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "schema_version",
+        "lifecycle_bundle_id",
+        "lifecycle_evidence_code_commit",
+        "config_sha256",
+        "independent_review_artifact",
+        "approval_purpose",
+        "approval_status",
+        "approved_at",
+        "approval_id",
+    }
+    if type(approval) is not dict or set(approval) != required:
+        raise ValueError("Lifecycle approval fields do not match the exact schema")
+    core = {key: value for key, value in approval.items() if key != "approval_id"}
+    if approval.get("schema_version") != APPROVAL_SCHEMA_VERSION:
+        raise ValueError("Lifecycle approval has an unsupported schema")
+    if approval.get("approval_id") != content_identity(core):
+        raise ValueError("Lifecycle approval identity is invalid")
+    bundle = verified_bundle["bundle"]
+    if approval.get("lifecycle_bundle_id") != bundle["bundle_id"]:
+        raise ValueError("Lifecycle approval pins the wrong bundle ID")
+    if approval.get("lifecycle_evidence_code_commit") != bundle["code_commit"]:
+        raise ValueError("Lifecycle approval pins the wrong code commit")
+    if approval.get("config_sha256") != bundle["config"]["sha256"]:
+        raise ValueError("Lifecycle approval pins the wrong config")
+    if approval.get("approval_purpose") != "full_history_acquisition_after_lifecycle_audit":
+        raise ValueError("Lifecycle approval has the wrong purpose")
+    if approval.get("approval_status") != "approved":
+        raise ValueError("Lifecycle approval is not approved")
+    review = approval.get("independent_review_artifact")
+    if type(review) is not dict or set(review) != {"identifier", "path", "sha256"}:
+        raise ValueError("Lifecycle approval review artifact is malformed")
+    review_path = Path(review["path"])
+    if not review_path.is_absolute() or sha256_path(review_path) != review["sha256"]:
+        raise ValueError("Lifecycle approval review artifact digest is invalid")
+    return {"approval": approval, "approval_path": path}
+
+
+def verify_runtime_matches_approved_commit(root: str | Path, code_commit: str) -> None:
+    """Permit later review-doc commits but reject changes to executable lifecycle code/config."""
+    result = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--quiet",
+            code_commit,
+            "--",
+            "src",
+            "scripts",
+            "config",
+            "pyproject.toml",
+        ],
+        cwd=Path(root),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("Runtime code/config differs from the approved lifecycle commit")
+
+
 def _verify_catalog_evidence_consistency(
     catalog: pd.DataFrame,
     classification: list[dict[str, Any]],
     announcements: list[dict[str, Any]],
     archive_rows: list[dict[str, Any]],
+    first_trades: list[dict[str, Any]],
+    scope_registry: dict[str, Any],
+    noncanonical_candidates: list[str],
+    announcement_audit: dict[str, Any],
 ) -> None:
     archive_by_symbol = {row.get("symbol"): row for row in archive_rows}
     if len(archive_by_symbol) != len(archive_rows) or set(catalog["symbol"]) != set(
@@ -118,8 +214,35 @@ def _verify_catalog_evidence_consistency(
     accepted_announcements = [
         item for item in announcements if item.get("match_status") == "accepted"
     ]
+    candidates = sorted(set(archive_by_symbol) | set(noncanonical_candidates))
+    scope_by_identity = verify_scope_registry(scope_registry, candidates)
+    trade_by_symbol = {row.get("symbol"): row for row in first_trades}
+    if len(trade_by_symbol) != len(first_trades):
+        raise ValueError("First-observed-trade evidence contains duplicate identities")
+    delisting_catalogs = [
+        item
+        for item in announcement_audit.get("catalogs", [])
+        if item.get("event_type") == "delisting"
+    ]
+    if len(delisting_catalogs) != 1:
+        raise ValueError("Delisting corpus audit identity is incomplete")
+    delisting_audit = delisting_catalogs[0]
+    if (
+        delisting_audit.get("inspection_policy") != "complete_catalog_detail_inspection"
+        or delisting_audit.get("candidate_articles") != delisting_audit.get("declared_total")
+    ):
+        raise ValueError("Delisting corpus was not inspected comprehensively")
     for row in catalog.to_dict("records"):
         symbol = row["symbol"]
+        scope = scope_by_identity[symbol]
+        for catalog_field, registry_field in (
+            ("scope_disposition", "product_scope"),
+            ("is_crypto_underlying", "is_crypto_underlying"),
+            ("is_stablecoin_underlying", "is_stablecoin_underlying"),
+            ("is_leveraged_token", "is_leveraged_token"),
+        ):
+            if row.get(catalog_field) != scope.get(registry_field):
+                raise ValueError("Catalog scope classification disagrees with bound registry")
         archive = archive_by_symbol[symbol]
         observed = archive.get("observed_archive_object_keys")
         if type(observed) is not list or not observed:
@@ -135,6 +258,8 @@ def _verify_catalog_evidence_consistency(
                 ("stablecoin_underlying", "is_stablecoin_underlying"),
                 ("leveraged_token", "is_leveraged_token"),
             ):
+                if type(row.get(field)) is not bool:
+                    continue
                 matching = [
                     item
                     for item in classification_by_key.get((symbol, dimension), [])
@@ -156,6 +281,31 @@ def _verify_catalog_evidence_consistency(
             ]
             if len(matching) != 1:
                 raise ValueError("Catalog listing start lacks exact accepted announcement evidence")
+        trade = trade_by_symbol.get(symbol)
+        if row.get("first_observed_trade_at") is not None:
+            if trade is None or trade.get("earliest_trade_timestamp") != row.get(
+                "first_observed_trade_at"
+            ):
+                raise ValueError("Catalog observed-trade anchor lacks exact primitive evidence")
+            raw_path = Path(trade.get("raw_path", ""))
+            if sha256_path(raw_path) != trade.get("computed_sha256") or trade.get(
+                "computed_sha256"
+            ) != trade.get("published_sha256"):
+                raise ValueError("First-observed-trade raw checksum evidence is invalid")
+            if parse_earliest_trade_timestamp(raw_path).isoformat() != trade.get(
+                "earliest_trade_timestamp"
+            ):
+                raise ValueError("First-observed-trade timestamp disagrees with raw ZIP")
+        basis = row.get("eligibility_age_anchor_basis")
+        if basis == "exact_official_original_launch" and row.get(
+            "eligibility_age_anchor_at"
+        ) != row.get("exact_official_trading_start_at"):
+            raise ValueError("Exact launch age anchor is not primitive-derived")
+        if basis in {
+            "first_observed_binance_futures_trade",
+            "legacy_pre_research_start_adjudicated",
+        } and row.get("eligibility_age_anchor_at") != row.get("first_observed_trade_at"):
+            raise ValueError("Observed-trade age anchor is not primitive-derived")
         if row.get("delisting_announcement_published_at") is not None:
             matching = [
                 item
@@ -188,6 +338,9 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         "archive_observations.json",
         "noncanonical_archive_prefix_queue.json",
         "readiness.json",
+        "historical_scope_registry.json",
+        "first_observed_trades.json",
+        "announcement_corpus_audit.json",
     }
     artifacts = bundle.get("artifacts")
     if type(artifacts) is not dict or set(artifacts) != required:
@@ -214,19 +367,46 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
     classification = json.loads(resolved["classification_evidence.json"].read_text("utf-8"))
     announcements = json.loads(resolved["announcement_evidence.json"].read_text("utf-8"))
     archive_rows = json.loads(resolved["archive_observations.json"].read_text("utf-8"))
-    if not all(type(value) is list for value in (classification, announcements, archive_rows)):
-        raise ValueError("Lifecycle evidence artifacts must contain record lists")
-    _verify_catalog_evidence_consistency(
-        catalog, classification, announcements, archive_rows
+    first_trades = json.loads(resolved["first_observed_trades.json"].read_text("utf-8"))
+    scope_registry = json.loads(
+        resolved["historical_scope_registry.json"].read_text("utf-8")
     )
+    announcement_audit = json.loads(
+        resolved["announcement_corpus_audit.json"].read_text("utf-8")
+    )
+    if not all(
+        type(value) is list
+        for value in (classification, announcements, archive_rows, first_trades)
+    ):
+        raise ValueError("Lifecycle evidence artifacts must contain record lists")
     noncanonical = json.loads(
         resolved["noncanonical_archive_prefix_queue.json"].read_text("utf-8")
     )
-    if noncanonical.get("status") != "quarantined_fail_closed" or type(
+    if noncanonical.get("status") != "reviewed_finite_universe" or type(
         noncanonical.get("prefixes")
     ) is not list:
         raise ValueError("Noncanonical archive queue is malformed")
-    recomputed = catalog_readiness(catalog, noncanonical["prefixes"])
+    _verify_catalog_evidence_consistency(
+        catalog,
+        classification,
+        announcements,
+        archive_rows,
+        first_trades,
+        scope_registry,
+        noncanonical["prefixes"],
+        announcement_audit,
+    )
+    unresolved_noncanonical = [
+        identity
+        for identity in noncanonical["prefixes"]
+        if next(
+            record
+            for record in scope_registry["records"]
+            if record["contract_identity"] == identity
+        )["scope_audit_status"]
+        != "complete"
+    ]
+    recomputed = catalog_readiness(catalog, unresolved_noncanonical)
     stored_readiness = json.loads(resolved["readiness.json"].read_text("utf-8"))
     if recomputed != stored_readiness:
         raise ValueError("Stored lifecycle readiness disagrees with recomputed evidence")
@@ -265,6 +445,12 @@ def verify_bound_plan(plan_path: str | Path) -> dict[str, Any]:
     bundle = verified["bundle"]
     if plan.get("lifecycle_bundle_id") != bundle["bundle_id"]:
         raise ValueError("Download plan references the wrong lifecycle bundle")
+    approval_path = Path(plan.get("lifecycle_approval", ""))
+    if not approval_path.is_absolute():
+        raise ValueError("Download plan lifecycle approval path must be absolute")
+    verified_approval = verify_approval_pin(approval_path, verified)
+    if plan.get("lifecycle_approval_id") != verified_approval["approval"]["approval_id"]:
+        raise ValueError("Download plan references the wrong lifecycle approval")
     if plan.get("config_sha256") != bundle["config"]["sha256"]:
         raise ValueError("Download plan references the wrong config digest")
     if plan.get("artifact_hashes") != {
@@ -319,4 +505,8 @@ def verify_bound_plan(plan_path: str | Path) -> dict[str, Any]:
     supplied = [validate_archive_object_key(key).object_key for key in plan["objects"]]
     if len(supplied) != len(set(supplied)) or set(supplied) != expected:
         raise ValueError("Download plan objects disagree with exact observed approved ZIP objects")
-    return {"plan": plan, "verified_bundle": verified}
+    return {
+        "plan": plan,
+        "verified_bundle": verified,
+        "verified_approval": verified_approval,
+    }

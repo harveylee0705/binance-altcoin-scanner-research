@@ -15,10 +15,13 @@ from alt_hot_scanner.data.provenance import (
     record_new_snapshot_provenance,
 )
 from alt_hot_scanner.universe.authorization import (
+    APPROVAL_SCHEMA_VERSION,
     PLAN_SCHEMA_VERSION,
     build_bundle_payload,
     build_plan_integrity,
     catalog_readiness,
+    content_identity,
+    sha256_path,
     verify_bound_plan,
     verify_lifecycle_bundle,
 )
@@ -27,6 +30,7 @@ from alt_hot_scanner.universe.lifecycle import (
     build_lifecycle_catalog,
     catalog_coverage,
 )
+from alt_hot_scanner.universe.scope_registry import build_historical_scope_registry
 
 
 def _announcement(
@@ -395,7 +399,7 @@ def _listing(symbol: str) -> dict:
     }
 
 
-def test_trading_without_delisting_is_ready_but_settling_without_delisting_is_not() -> None:
+def test_completed_delisting_search_without_timestamp_does_not_remove_history() -> None:
     archives = pd.DataFrame([_archive("AAAUSDT"), _archive("BBBUSDT")])
     current = pd.DataFrame([_current("AAAUSDT", "TRADING"), _current("BBBUSDT", "SETTLING")])
     evidence = pd.DataFrame([_listing("AAAUSDT"), _listing("BBBUSDT")])
@@ -404,10 +408,10 @@ def test_trading_without_delisting_is_ready_but_settling_without_delisting_is_no
     ).set_index("symbol")
     assert catalog.loc["AAAUSDT", "historical_inclusion_readiness"] == "ready"
     assert catalog.loc["AAAUSDT", "delisting_evidence_state"] == "not_applicable_currently_trading"
-    assert catalog.loc["BBBUSDT", "historical_inclusion_readiness"] == "blocked"
-    assert "unresolved_current_non_trading" in catalog.loc[
-        "BBBUSDT", "delisting_evidence_state"
-    ]
+    assert catalog.loc["BBBUSDT", "historical_inclusion_readiness"] == "ready"
+    assert catalog.loc["BBBUSDT", "delisting_evidence_state"] == (
+        "official_search_completed_no_reliable_announcement_timestamp"
+    )
 
 
 def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
@@ -432,13 +436,48 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
     (tmp_path / "classification_evidence.json").write_text(json.dumps(classification))
     (tmp_path / "announcement_evidence.json").write_text(json.dumps([_listing("AAAUSDT")]))
     (tmp_path / "archive_observations.json").write_text(json.dumps([_archive("AAAUSDT")]))
-    queue = {"status": "quarantined_fail_closed", "prefixes": []}
+    queue = {"status": "reviewed_finite_universe", "prefixes": [], "dispositions": {}}
     (tmp_path / "noncanonical_archive_prefix_queue.json").write_text(json.dumps(queue))
     readiness = catalog_readiness(catalog, [])
     (tmp_path / "readiness.json").write_text(json.dumps(readiness))
     coverage = catalog_coverage(catalog)
     coverage["recomputed_readiness"] = readiness
     (tmp_path / "coverage.json").write_text(json.dumps(coverage))
+    exchange_payload = {
+        "symbols": [
+            {
+                "symbol": "AAAUSDT",
+                "baseAsset": "AAA",
+                "quoteAsset": "USDT",
+                "marginAsset": "USDT",
+                "contractType": "PERPETUAL",
+                "underlyingType": "COIN",
+                "underlyingSubType": ["Layer-1"],
+            }
+        ]
+    }
+    registry = build_historical_scope_registry(
+        ["AAAUSDT"],
+        exchange_payload,
+        stablecoin_underlyings=["USDT", "USTC"],
+        audited_at="2026-01-01T00:00:00+00:00",
+    )
+    (tmp_path / "historical_scope_registry.json").write_text(json.dumps(registry))
+    (tmp_path / "first_observed_trades.json").write_text("[]")
+    (tmp_path / "announcement_corpus_audit.json").write_text(
+        json.dumps(
+            {
+                "catalogs": [
+                    {
+                        "event_type": "delisting",
+                        "inspection_policy": "complete_catalog_detail_inspection",
+                        "candidate_articles": 0,
+                        "declared_total": 0,
+                    }
+                ]
+            }
+        )
+    )
     config = tmp_path / "config.yaml"
     config.write_text(
         "version: scanner-v0.1\n"
@@ -456,6 +495,9 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
         "archive_observations.json",
         "noncanonical_archive_prefix_queue.json",
         "readiness.json",
+        "historical_scope_registry.json",
+        "first_observed_trades.json",
+        "announcement_corpus_audit.json",
     ]
     bundle = build_bundle_payload(
         report_root=tmp_path,
@@ -472,12 +514,33 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
 def _write_plan(tmp_path: Path, bundle_path: Path) -> Path:
     verified = verify_lifecycle_bundle(bundle_path)
     bundle = verified["bundle"]
+    review_path = tmp_path / "independent-review.md"
+    review_path.write_text("PASS")
+    approval_core = {
+        "schema_version": APPROVAL_SCHEMA_VERSION,
+        "lifecycle_bundle_id": bundle["bundle_id"],
+        "lifecycle_evidence_code_commit": bundle["code_commit"],
+        "config_sha256": bundle["config"]["sha256"],
+        "independent_review_artifact": {
+            "identifier": "fixture-review",
+            "path": str(review_path.resolve()),
+            "sha256": sha256_path(review_path),
+        },
+        "approval_purpose": "full_history_acquisition_after_lifecycle_audit",
+        "approval_status": "approved",
+        "approved_at": "2026-01-01T00:00:00+00:00",
+    }
+    approval = {**approval_core, "approval_id": content_identity(approval_core)}
+    approval_path = tmp_path / "fixture-approval.json"
+    approval_path.write_text(json.dumps(approval))
     plan = {
         "schema_version": PLAN_SCHEMA_VERSION,
         "created_at": "2026-01-01T00:00:00+00:00",
         "purpose": "authorized_full_history_archive_download",
         "lifecycle_bundle": str(bundle_path.resolve()),
         "lifecycle_bundle_id": bundle["bundle_id"],
+        "lifecycle_approval": str(approval_path.resolve()),
+        "lifecycle_approval_id": approval["approval_id"],
         "artifact_hashes": {
             name: descriptor["sha256"] for name, descriptor in bundle["artifacts"].items()
         },

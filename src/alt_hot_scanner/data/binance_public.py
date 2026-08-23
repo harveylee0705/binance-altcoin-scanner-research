@@ -1,31 +1,49 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import os
 import re
 import secrets
 import tempfile
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from alt_hot_scanner.identity import require_binance_token, require_canonical_text
+import pandas as pd
+
+from alt_hot_scanner.identity import (
+    require_archive_symbol_identity,
+    require_binance_token,
+    require_canonical_text,
+    require_semantic_contract_identity,
+    safe_identity_component,
+)
+from alt_hot_scanner.utils.numeric import strict_millisecond_timestamp
 
 ARCHIVE_HOST = "https://data.binance.vision"
 INDEX_HOST = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ARCHIVE_KEY = re.compile(
     r"data/futures/um/monthly/klines/"
-    r"(?P<symbol>[A-Z0-9]{1,64})/"
+    r"(?P<symbol>[^/\\]{1,128})/"
     r"(?P<interval>1h)/"
     r"(?P=symbol)-(?P=interval)-(?P<period>20[0-9]{2}-(?:0[1-9]|1[0-2]))\.zip"
+)
+_DAILY_TRADE_KEY = re.compile(
+    r"data/futures/um/daily/trades/"
+    r"(?P<symbol>[^/\\]{1,128})/"
+    r"(?P=symbol)-trades-(?P<period>20[0-9]{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01]))\.zip"
 )
 
 
@@ -36,6 +54,28 @@ class ArchiveObjectIdentity:
     interval: str
     period: str
     filename: str
+
+
+@dataclass(frozen=True)
+class DailyTradeArchiveIdentity:
+    object_key: str
+    symbol: str
+    period: str
+    filename: str
+
+
+@dataclass(frozen=True)
+class FirstObservedTradeEvidence:
+    symbol: str
+    archive_object_key: str
+    archive_date: str
+    published_sha256: str
+    computed_sha256: str
+    raw_path: str
+    original_retrieval_timestamp: str
+    earliest_trade_timestamp: str
+    parser_version: str
+    evidence_status: str
 
 
 @dataclass(frozen=True)
@@ -130,17 +170,37 @@ class ArchiveAcquisitionError(RuntimeError):
 
 def validate_archive_object_key(object_key: object) -> ArchiveObjectIdentity:
     """Accept only the frozen Binance USD-M monthly 1H kline object-key grammar."""
-    key = require_canonical_text(object_key, "object_key")
-    if "\\" in key:
-        raise ValueError("object_key must use POSIX separators only")
+    if type(object_key) is not str or not object_key or object_key != object_key.strip():
+        raise ValueError("object_key must be nonempty canonical text")
+    key = object_key
+    if "\\" in key or unicodedata.normalize("NFC", key) != key:
+        raise ValueError("object_key must use canonical Unicode and POSIX separators")
     match = _ARCHIVE_KEY.fullmatch(key)
     if match is None:
         raise ValueError("object_key is outside the Binance USD-M monthly 1H kline hierarchy")
-    symbol = require_binance_token(match.group("symbol"), "object_key symbol")
+    symbol = require_archive_symbol_identity(match.group("symbol"), "object_key symbol")
     return ArchiveObjectIdentity(
         object_key=key,
         symbol=symbol,
         interval=match.group("interval"),
+        period=match.group("period"),
+        filename=key.rsplit("/", 1)[-1],
+    )
+
+
+def validate_daily_trade_object_key(object_key: object) -> DailyTradeArchiveIdentity:
+    if type(object_key) is not str or not object_key or object_key != object_key.strip():
+        raise ValueError("daily trade object_key must be nonempty canonical text")
+    if unicodedata.normalize("NFC", object_key) != object_key or "\\" in object_key:
+        raise ValueError("daily trade object_key is not canonical or safe")
+    key = object_key
+    match = _DAILY_TRADE_KEY.fullmatch(key)
+    if match is None:
+        raise ValueError("object_key is outside the Binance USD-M daily trade hierarchy")
+    symbol = require_archive_symbol_identity(match.group("symbol"), "trade archive symbol")
+    return DailyTradeArchiveIdentity(
+        object_key=key,
+        symbol=symbol,
         period=match.group("period"),
         filename=key.rsplit("/", 1)[-1],
     )
@@ -638,9 +698,17 @@ def list_archive_index(
     page_observer: Callable[[int, str, bytes], None] | None = None,
 ) -> ArchiveIndexListing:
     """Read a complete, internally consistent S3 ListObjectsV2 result."""
-    canonical_prefix = require_canonical_text(prefix, "archive index prefix")
-    if not canonical_prefix.startswith("data/futures/um/monthly/klines/") or "\\" in canonical_prefix:
-        raise ValueError("Archive index prefix is outside the frozen USD-M monthly kline hierarchy")
+    if type(prefix) is not str or not prefix or prefix != prefix.strip():
+        raise ValueError("archive index prefix must be nonempty canonical text")
+    if unicodedata.normalize("NFC", prefix) != prefix:
+        raise ValueError("archive index prefix must use canonical Unicode encoding")
+    canonical_prefix = prefix
+    allowed_prefix = canonical_prefix.startswith("data/futures/um/monthly/klines/") or (
+        canonical_prefix.startswith("data/futures/um/daily/trades/")
+        and "\\" not in canonical_prefix
+    )
+    if not allowed_prefix or "\\" in canonical_prefix:
+        raise ValueError("Archive index prefix is outside an approved Binance USD-M hierarchy")
     if delimiter not in {None, "/"}:
         raise ValueError("Archive index delimiter must be '/' or omitted")
 
@@ -735,6 +803,103 @@ def list_archive_index(
     )
 
 
+def discover_earliest_daily_trade_archive(
+    symbol: str,
+    *,
+    page_observer: Callable[[int, str, bytes], None] | None = None,
+) -> DailyTradeArchiveIdentity:
+    semantic_symbol = require_semantic_contract_identity(symbol, "trade probe symbol")
+    prefix = f"data/futures/um/daily/trades/{semantic_symbol}/"
+    listing = list_archive_index(prefix, page_observer=page_observer)
+    identities: dict[str, DailyTradeArchiveIdentity] = {}
+    for key in listing.keys:
+        candidate = key.removesuffix(".CHECKSUM")
+        try:
+            identity = validate_daily_trade_object_key(candidate)
+        except ValueError as exc:
+            raise ValueError(f"Unexpected object in daily trade listing for {symbol}") from exc
+        if identity.symbol != semantic_symbol:
+            raise ValueError("Daily trade listing returned a mismatched symbol")
+        if not key.endswith(".CHECKSUM"):
+            identities[identity.object_key] = identity
+    if not identities:
+        raise ValueError(f"No daily trade archives found for {semantic_symbol}")
+    return min(identities.values(), key=lambda value: (value.period, value.object_key))
+
+
+def parse_earliest_trade_timestamp(path: str | Path) -> pd.Timestamp:
+    """Parse the true minimum timestamp from one checksum-verified Binance trade ZIP."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = [item for item in archive.infolist() if not item.is_dir()]
+            if len(members) != 1 or not members[0].filename.endswith(".csv"):
+                raise ValueError("Trade archive must contain exactly one CSV")
+            minimum: int | None = None
+            with archive.open(members[0]) as raw:
+                reader = csv.reader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""))
+                for row_number, row in enumerate(reader, start=1):
+                    if row_number == 1 and row and row[0].strip().lower() == "id":
+                        continue
+                    if len(row) < 5:
+                        raise ValueError(f"Trade row {row_number} has too few fields")
+                    timestamp = strict_millisecond_timestamp(
+                        row[4], f"trade row {row_number} timestamp"
+                    )
+                    minimum = timestamp if minimum is None else min(minimum, timestamp)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Trade archive is not a valid ZIP") from exc
+    if minimum is None:
+        raise ValueError("Trade archive contains no trades")
+    return pd.to_datetime(minimum, unit="ms", utc=True)
+
+
+def acquire_first_observed_trade(
+    symbol: str,
+    raw_root: str | Path,
+    *,
+    page_observer: Callable[[int, str, bytes], None] | None = None,
+) -> FirstObservedTradeEvidence:
+    """Download only the earliest daily trade ZIP and verify its official SHA-256."""
+    identity = discover_earliest_daily_trade_archive(symbol, page_observer=page_observer)
+    encoded_key = urllib.parse.quote(identity.object_key, safe="/")
+    url = f"{ARCHIVE_HOST}/{encoded_key}"
+    checksum_url = f"{url}.CHECKSUM"
+    checksum_payload = _read_url(checksum_url)
+    published = parse_checksum_sidecar(checksum_payload, identity)  # type: ignore[arg-type]
+    destination = (
+        Path(raw_root).resolve(strict=False)
+        / "first_observed_trades"
+        / safe_identity_component(identity.symbol)
+        / "earliest_daily_trade.zip"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        computed, _ = sha256_file(destination)
+        if computed != published:
+            raise ValueError("Existing first-trade evidence differs from published checksum")
+        retrieved_at = datetime.fromtimestamp(destination.stat().st_mtime, UTC).isoformat()
+    else:
+        payload = _read_url(url)
+        computed = hashlib.sha256(payload).hexdigest()
+        if computed != published:
+            raise ValueError("First-trade archive differs from published checksum")
+        _write_bytes_exclusive_atomic(destination, payload)
+        retrieved_at = datetime.now(UTC).isoformat()
+    earliest = parse_earliest_trade_timestamp(destination)
+    return FirstObservedTradeEvidence(
+        symbol=identity.symbol,
+        archive_object_key=identity.object_key,
+        archive_date=identity.period,
+        published_sha256=published,
+        computed_sha256=computed,
+        raw_path=str(destination.resolve()),
+        original_retrieval_timestamp=retrieved_at,
+        earliest_trade_timestamp=earliest.isoformat(),
+        parser_version="binance-usdm-daily-trade-first-observation-v1",
+        evidence_status="checksum_verified_official_binance_futures_trade",
+    )
+
+
 def discover_archive_symbol_candidates(
     *, page_observer: Callable[[int, str, bytes], None] | None = None
 ) -> ArchiveSymbolDiscovery:
@@ -797,7 +962,7 @@ def discover_archive_months(
     page_observer: Callable[[int, str, bytes], None] | None = None,
 ) -> ArchiveMonthObservation:
     """Capture observed monthly 1H bounds without calling them lifecycle timestamps."""
-    canonical_symbol = require_binance_token(symbol, "archive symbol")
+    canonical_symbol = require_archive_symbol_identity(symbol, "archive symbol")
     prefix = f"data/futures/um/monthly/klines/{canonical_symbol}/1h/"
     listing = list_archive_index(prefix, page_observer=page_observer)
     identities: dict[str, ArchiveObjectIdentity] = {}
@@ -840,7 +1005,7 @@ def observed_zip_keys_from_index_snapshots(
     paths: list[str] | tuple[str, ...], symbol: str
 ) -> tuple[str, ...]:
     """Recover exact ZIP objects from preserved official index pages; sidecars do not count."""
-    canonical_symbol = require_binance_token(symbol, "archive symbol")
+    canonical_symbol = require_archive_symbol_identity(symbol, "archive symbol")
     namespace_uri = "http://s3.amazonaws.com/doc/2006-03-01/"
     keys: set[str] = set()
     for raw_path in paths:

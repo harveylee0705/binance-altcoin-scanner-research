@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from collections.abc import Sequence
@@ -35,6 +36,38 @@ def require_canonical_text(value: object, field: str, *, token: bool = False) ->
 
 def require_binance_token(value: object, field: str) -> str:
     return require_canonical_text(value, field, token=True)
+
+
+def require_semantic_contract_identity(value: object, field: str) -> str:
+    """Validate an exact exchange identity without imposing an ASCII storage grammar."""
+    if type(value) is not str:
+        raise IdentityValidationError(f"{field} must be a string")
+    if not value or value != value.strip() or len(value) > 128:
+        raise IdentityValidationError(f"{field} must be nonempty, unpadded, and at most 128 chars")
+    if unicodedata.normalize("NFC", value) != value:
+        raise IdentityValidationError(f"{field} must use canonical Unicode encoding")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise IdentityValidationError(f"{field} must not contain control characters")
+    if any(character in "/\\:" for character in value):
+        raise IdentityValidationError(f"{field} contains an unsafe hierarchy character")
+    return value
+
+
+def require_archive_symbol_identity(value: object, field: str) -> str:
+    """Accept canonical ASCII Binance tokens or exact letter/number Unicode symbols."""
+    identity = require_semantic_contract_identity(value, field)
+    if identity.isascii():
+        return require_binance_token(identity, field)
+    if not all(character.isalnum() for character in identity):
+        raise IdentityValidationError(f"{field} contains unsupported symbol punctuation")
+    return identity
+
+
+def safe_identity_component(value: object, field: str = "contract identity") -> str:
+    """Return a collision-resistant ASCII path component while preserving identity separately."""
+    identity = require_semantic_contract_identity(value, field)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"identity_{digest}"
 
 
 def require_identity_sequence(value: object, field: str) -> tuple[str, ...]:

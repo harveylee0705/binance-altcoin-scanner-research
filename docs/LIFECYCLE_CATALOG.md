@@ -1,6 +1,6 @@
 # Historical USD-M Contract Lifecycle Catalog
 
-Schema version: `binance-usdm-lifecycle-v2`
+Schema version: `binance-usdm-lifecycle-v3`
 
 The catalog is research infrastructure, not a scanner result. Build it with:
 
@@ -19,7 +19,10 @@ HotScore, label outcomes, or read validation/holdout scanner observations.
    observed data existence only.
 2. A current official `/fapi/v1/exchangeInfo` snapshot supplies current identity, product, subtype,
    onboard, delivery, and status metadata. It is never treated as historical universe membership.
-3. Binance's public structured CMS list/detail responses supply listing/delisting articles. Catalog
+3. The earliest available official USD-M daily trade archive for each reviewed in-scope identity is
+   downloaded once, verified against its official SHA-256 sidecar, and parsed for the strict integer
+   minimum trade timestamp. This is `first_observed_trade_at`, never an exact launch timestamp.
+4. Binance's public structured CMS list/detail responses supply listing/delisting articles. Catalog
    pages and article details are stored as immutable raw JSON. Article publication time remains
    separate from stated trading-start or last-trading time.
 
@@ -29,7 +32,8 @@ The CMS acquisition uses these publicly accessible endpoints:
 - `.../bapi/composite/v1/public/cms/article/detail/query`
 
 No authentication, browser automation, anti-bot bypass, or access-control circumvention is used.
-The parser is versioned as `binance-announcement-semantic-v2`.
+The parser is versioned as `binance-announcement-semantic-v3`. Every article in the Futures
+delisting/settlement catalog is inspected; delisting acquisition is not title-filtered on `delist`.
 
 ## Conservative matching and quarantine
 
@@ -45,17 +49,21 @@ rows may supply distinct times. Timestamps are never assigned by first occurrenc
 or equal symbol/timestamp counts. Ambiguous layouts and conflicting applicable articles remain
 unresolved.
 
-Stablecoin and leveraged-token classification is tri-state. Positive official subtype evidence and
-the frozen known-stablecoin guard can establish `True`; absence of a subtype never establishes
-`False`. A `False` value requires accepted versioned reviewed evidence, conflicts stay explicit, and
-unknown classification fails closed. Name suffixes such as `UP`/`DOWN` are never evidence.
+Stablecoin, leveraged-token, and product classification is bound to a versioned finite-universe
+registry containing the exact canonical candidate-set SHA-256. Positive exclusions retain evidence.
+For that exact completed audit only, remaining identities may receive
+`reviewed_finite_universe_negative`; any new candidate invalidates the registry. Name suffixes such
+as `UP`/`DOWN` are discovery flags only and never classification evidence.
 
 ## Eligibility contract
 
-Eligibility requires resolved instrument scope, an exact official trading start, 30 elapsed calendar
-days, valid market data, and a signal strictly before an exact known delisting-announcement publication
-time. A null delisting announcement does not create an approximate cutoff. Current status never
-back-filters history. Archive first/last months and valid-kline bounds never become lifecycle events.
+Eligibility requires resolved instrument scope, a resolved eligibility-age anchor, 30 elapsed
+calendar days, valid market data, and a signal strictly before an exact known delisting-announcement
+publication time. Exact official original launch is preferred. Otherwise a checksum-verified first
+Binance Futures trade is a conservative live boundary and is never relabeled exact. A completed
+official delisting search with no reliable publication timestamp leaves the cutoff null and does not
+remove historical data. Incomplete/conflicting evidence fails closed. Current status never
+back-filters history.
 
 Each run writes its catalog, evidence tables, recomputed readiness report, lifecycle bundle,
 coverage report, acquisition manifest, and unresolved queue under ignored
@@ -65,10 +73,20 @@ receive immutable provenance sidecars; legacy cache entries without recoverable 
 remain retrieval-time unresolved.
 
 Full-history planning uses only actual ZIP keys observed in the preserved paginated archive index.
-The planner and downloader re-verify the bundle, artifact hashes, config digest, recomputed readiness,
-exact plan schema, and exact observed object set. A checksum sidecar alone is not archive evidence.
+Checkpoint resume confines and re-hashes every raw XML page, verifies available provenance sidecars,
+reparses ZIP identities/bounds, and compares reconstructed primitives with checkpoint fields. Legacy
+snapshots without recoverable acquisition time retain a null time.
+
+The planner has no implicit newest-bundle mode. It requires exact `--bundle` and `--approval` paths.
+The approval pin binds the bundle ID, lifecycle code commit, config digest, and independent-review
+artifact hash. No production approval is generated by the lifecycle builder. The integrity threat
+model covers stale/wrong bundles, changed bytes, corrupt evidence, mismatched config/code, forged
+simple plans, and superseded review artifacts. It intentionally does not attempt to defeat an
+operator with full Git/filesystem write access who fabricates every primitive and recomputes hashes;
+SHA-256 integrity plus explicit reviewed-bundle pinning is sufficient for this local harness.
 
 Monthly archives end at the last fully completed UTC calendar month. The repository does not yet
-implement a separately verified daily-archive or API tail, so it cannot claim the latest fully
-completed available 2026 bars during an in-progress month. That tail is a pre-evaluation acquisition
-blocker and is not implemented by this lifecycle remediation.
+implement the current-month data tail, so it cannot claim the latest fully completed available 2026
+bars during an in-progress month. A later acquisition phase must combine completed monthly archives,
+non-overlapping daily archives after the monthly boundary, and if needed a small API tail. That work
+is not part of this lifecycle remediation.

@@ -25,7 +25,7 @@ from alt_hot_scanner.utils.numeric import strict_millisecond_timestamp
 
 ANNOUNCEMENT_API = "https://www.binance.com/bapi/composite/v1/public/cms/article"
 ANNOUNCEMENT_PAGE = "https://www.binance.com/en/support/announcement/detail"
-ANNOUNCEMENT_PARSER_VERSION = "binance-announcement-semantic-v2"
+ANNOUNCEMENT_PARSER_VERSION = "binance-announcement-semantic-v3"
 LISTING_CATALOG_ID = 48
 DELISTING_CATALOG_ID = 161
 PAGE_SIZE = 50
@@ -147,7 +147,8 @@ _LAUNCH_ACTION = re.compile(
     re.IGNORECASE,
 )
 _DELIST_ACTION = re.compile(
-    r"\b(?:will\s+)?(?:delist|cease\s+trading|settle|close\s+all\s+positions)\b",
+    r"\b(?:will\s+)?(?:delist|cease\s+trading|settle|close\s+all\s+positions|"
+    r"terminate(?:s|d)?\s+(?:the\s+)?contract)\b",
     re.IGNORECASE,
 )
 
@@ -166,6 +167,10 @@ def classify_article_semantics(title: str, body_text: str) -> str:
         return "portfolio_margin_or_multi_asset_enablement"
     if "pre-market" in title_lower or "pre market" in title_lower:
         return "pre_market_or_other_product_enablement"
+    title_futures_product = "binance futures" in title_lower or "usdⓢ-m futures" in title_lower
+    title_perpetual_product = "perpetual" in title_lower and "contract" in title_lower
+    if title_futures_product and title_perpetual_product and _DELIST_ACTION.search(title_lower):
+        return "delisting_or_settlement"
     if any(
         term in title_lower
         for term in (
@@ -182,10 +187,6 @@ def classify_article_semantics(title: str, body_text: str) -> str:
         term in title_lower for term in ("maintenance", "system upgrade", "temporary suspension")
     ):
         return "maintenance_or_operational"
-    title_futures_product = "binance futures" in title_lower or "usdⓢ-m futures" in title_lower
-    title_perpetual_product = "perpetual" in title_lower and "contract" in title_lower
-    if title_futures_product and title_perpetual_product and _DELIST_ACTION.search(title_lower):
-        return "delisting_or_settlement"
     if title_futures_product and title_perpetual_product and _LAUNCH_ACTION.search(title_lower):
         return "original_perpetual_launch"
     if "copy trading" in combined:
@@ -240,14 +241,27 @@ def _action_anchored_event_times(
         ]
         times = _timestamps_in_segment(segment)
         has_action = action.search(segment) is not None
-        structured_row = action_context and bool(segment_symbols) and len(times) == 1
+        residual = segment
+        for pattern in (_DATE_FIRST, _TIME_FIRST):
+            residual = pattern.sub(" ", residual)
+        for symbol in segment_symbols:
+            residual = residual.replace(symbol, " ")
+        residual = re.sub(r"\b(?:and|or|UTC)\b|[\s:;,()\-/]", "", residual, flags=re.IGNORECASE)
+        # A carried launch header is allowed only for a bare symbol/time table row.
+        # Any product, operational, or enablement prose terminates the context.
+        structured_row = (
+            action_context
+            and bool(segment_symbols)
+            and len(times) == 1
+            and residual == ""
+        )
         explicit_shared = has_action and bool(segment_symbols) and len(times) == 1
         if structured_row or explicit_shared:
             for symbol in segment_symbols:
                 candidates[symbol].append(times[0])
         if has_action and not segment_symbols and not times:
             action_context = True
-        elif not segment_symbols and not times:
+        elif not structured_row:
             action_context = False
     for symbol, values in candidates.items():
         unique = list(dict.fromkeys(values))
@@ -452,7 +466,7 @@ def acquire_announcement_corpus(
             for article in articles
             if isinstance(article, dict)
             and isinstance(article.get("title"), str)
-            and _candidate_title(event_type, article["title"])
+            and (event_type == "delisting" or _candidate_title(event_type, article["title"]))
         ]
         for candidate_position, article in enumerate(candidates, start=1):
             code = require_canonical_text(article.get("code"), "article code")
@@ -506,6 +520,11 @@ def acquire_announcement_corpus(
                 "declared_total": expected_total,
                 "pages": page - 1,
                 "candidate_articles": len(candidates),
+                "inspection_policy": (
+                    "complete_catalog_detail_inspection"
+                    if event_type == "delisting"
+                    else "strict_positive_listing_title_prefilter"
+                ),
                 "page_sha256s": page_checksums,
             }
         )

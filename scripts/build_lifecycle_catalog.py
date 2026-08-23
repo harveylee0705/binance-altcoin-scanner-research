@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,11 +15,12 @@ import pandas as pd
 from alt_hot_scanner.data.announcements import acquire_announcement_corpus
 from alt_hot_scanner.data.binance_public import (
     INDEX_HOST,
+    acquire_first_observed_trade,
     collision_resistant_run_id,
     discover_archive_months,
     discover_archive_symbol_candidates,
     fetch_exchange_info_snapshot,
-    observed_zip_keys_from_index_snapshots,
+    parse_earliest_trade_timestamp,
     sha256_file,
     write_bytes_exclusive,
     write_json_exclusive,
@@ -27,12 +29,21 @@ from alt_hot_scanner.data.provenance import (
     load_snapshot_provenance,
     record_new_snapshot_provenance,
 )
+from alt_hot_scanner.identity import safe_identity_component
 from alt_hot_scanner.universe.authorization import (
     build_bundle_payload,
     catalog_readiness,
 )
+from alt_hot_scanner.universe.checkpoint import (
+    ARCHIVE_CHECKPOINT_SCHEMA_VERSION,
+    verify_archive_checkpoint,
+)
 from alt_hot_scanner.universe.contracts import records_from_exchange_info
 from alt_hot_scanner.universe.lifecycle import build_lifecycle_catalog, catalog_coverage
+from alt_hot_scanner.universe.scope_registry import (
+    build_historical_scope_registry,
+    verify_scope_registry,
+)
 from alt_hot_scanner.utils.config import load_config
 
 EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -72,13 +83,19 @@ def main() -> None:
     def observer(label: str):
         def save(page: int, url: str, payload: bytes) -> None:
             digest = hashlib.sha256(payload).hexdigest()
-            path = raw_root / "archive_index" / f"{label}_page_{page:03d}_{digest[:16]}.xml"
-            write_bytes_exclusive(path, payload)
-            record_new_snapshot_provenance(
-                path,
-                url=url,
-                parser_version="binance-s3-listobjectsv2-v2",
-            )
+            safe_label = "symbols" if label == "symbols" else safe_identity_component(label)
+            path = raw_root / "archive_index" / f"{safe_label}_page_{page:03d}_{digest[:16]}.xml"
+            if path.exists():
+                if sha256_file(path)[0] != digest:
+                    raise FileExistsError(f"Existing raw archive-index snapshot differs: {path}")
+                load_snapshot_provenance(path, expected_url=url, expected_sha256=digest)
+            else:
+                write_bytes_exclusive(path, payload)
+                record_new_snapshot_provenance(
+                    path,
+                    url=url,
+                    parser_version="binance-s3-listobjectsv2-v2",
+                )
             archive_raw_paths.setdefault(label, []).append(str(path.resolve()))
             archive_raw_hashes.setdefault(label, []).append(digest)
 
@@ -88,20 +105,11 @@ def main() -> None:
     if args.resume_run:
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Archive checkpoint not found: {checkpoint_path}")
-        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        checkpoint = verify_archive_checkpoint(checkpoint_path, raw_root)
         symbols = checkpoint["canonical_symbols"]
         quarantined_prefixes = checkpoint["quarantined_prefixes"]
         symbol_audit = checkpoint["symbol_audit"]
         archive_frame = pd.DataFrame(checkpoint["archive_observations"])
-        if "observed_archive_object_keys" not in archive_frame.columns:
-            archive_frame["observed_archive_object_keys"] = archive_frame.apply(
-                lambda row: list(
-                    observed_zip_keys_from_index_snapshots(
-                        row["archive_raw_snapshot_paths"], row["symbol"]
-                    )
-                ),
-                axis=1,
-            )
     else:
         symbol_discovery = discover_archive_symbol_candidates(
             page_observer=observer("symbols")
@@ -127,9 +135,12 @@ def main() -> None:
         write_json_exclusive(
             checkpoint_path,
             {
+                "schema_version": ARCHIVE_CHECKPOINT_SCHEMA_VERSION,
                 "canonical_symbols": symbols,
                 "quarantined_prefixes": quarantined_prefixes,
                 "symbol_audit": symbol_audit,
+                "symbol_raw_snapshot_paths": archive_raw_paths["symbols"],
+                "symbol_raw_snapshot_sha256s": archive_raw_hashes["symbols"],
                 "archive_observations": archive_frame.to_dict("records"),
             },
         )
@@ -162,6 +173,78 @@ def main() -> None:
         stablecoin_underlyings=config["universe"]["stablecoin_underlyings"],
     )
 
+    all_candidates = sorted([*symbols, *quarantined_prefixes])
+    scope_registry = build_historical_scope_registry(
+        all_candidates,
+        exchange_payload,
+        stablecoin_underlyings=config["universe"]["stablecoin_underlyings"],
+    )
+    scope_by_identity = verify_scope_registry(scope_registry, all_candidates)
+    unicode_in_scope = [
+        identity
+        for identity in quarantined_prefixes
+        if scope_by_identity[identity]["product_scope"]
+        in {"in_scope_crypto_perpetual", "benchmark_only"}
+    ]
+    extra_observations: list[dict[str, Any]] = []
+    for symbol in unicode_in_scope:
+        observation = asdict(
+            discover_archive_months(
+                symbol,
+                discovered_at=discovered_at,
+                page_observer=observer(symbol),
+            )
+        )
+        observation["archive_raw_snapshot_paths"] = archive_raw_paths[symbol]
+        observation["archive_raw_snapshot_sha256s"] = archive_raw_hashes[symbol]
+        extra_observations.append(observation)
+    if extra_observations:
+        archive_frame = pd.concat(
+            [archive_frame, pd.DataFrame.from_records(extra_observations)], ignore_index=True
+        )
+
+    probe_symbols = sorted(
+        identity
+        for identity, scope in scope_by_identity.items()
+        if scope["product_scope"] in {"in_scope_crypto_perpetual", "benchmark_only"}
+    )
+    probe_checkpoint = raw_root / "trade_probe" / "first_observed_trades.json"
+    if probe_checkpoint.exists():
+        first_trade_records = json.loads(probe_checkpoint.read_text(encoding="utf-8"))
+        if sorted(row.get("symbol") for row in first_trade_records) != probe_symbols:
+            raise ValueError("First-observed-trade checkpoint candidate identities changed")
+
+        def verify_trade_record(row: dict[str, Any]) -> None:
+            computed, _ = sha256_file(row["raw_path"])
+            if computed != row["computed_sha256"] or computed != row["published_sha256"]:
+                raise ValueError("First-observed-trade checkpoint checksum mismatch")
+            if parse_earliest_trade_timestamp(row["raw_path"]).isoformat() != row[
+                "earliest_trade_timestamp"
+            ]:
+                raise ValueError("First-observed-trade checkpoint timestamp mismatch")
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(verify_trade_record, first_trade_records))
+    else:
+        first_trade_records = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            pending = {
+                executor.submit(
+                    acquire_first_observed_trade, symbol, raw_root / "trade_probe"
+                ): symbol
+                for symbol in probe_symbols
+            }
+            for position, future in enumerate(as_completed(pending), start=1):
+                first_trade_records.append(asdict(future.result()))
+                if position % 25 == 0:
+                    print(
+                        f"First-observed-trade lifecycle probe: {position}/{len(probe_symbols)}",
+                        flush=True,
+                    )
+        first_trade_records.sort(key=lambda row: row["symbol"])
+        write_bytes_exclusive(probe_checkpoint, _json_bytes(first_trade_records))
+    first_trade_frame = pd.DataFrame.from_records(first_trade_records)
+
     announcement_frame, announcement_audit = acquire_announcement_corpus(
         raw_root / "announcements", set(symbols)
     )
@@ -170,24 +253,23 @@ def main() -> None:
         exchange_records,
         announcement_frame,
         announcement_search_completed=True,
+        first_observed_trades=first_trade_frame,
+        scope_registry_records=scope_registry["records"],
     )
     coverage = catalog_coverage(catalog)
     noncanonical_usdt = sum(symbol.endswith("USDT") for symbol in quarantined_prefixes)
-    coverage["canonical_archive_symbols"] = coverage["total_archive_discovered_symbols"]
+    coverage["canonical_archive_symbols"] = len(symbols)
     coverage["total_archive_discovered_symbols"] = symbol_audit["unique_prefix_count"]
-    coverage["total_usdt_candidate_symbols"] += noncanonical_usdt
-    coverage["archive_only_symbols"] += noncanonical_usdt
-    coverage["unresolved_classification_cases"] += noncanonical_usdt
-    coverage["unresolved_lifecycle_cases"] += noncanonical_usdt
-    coverage["currently_quarantined"] += noncanonical_usdt
+    coverage["canonical_usdt_candidates"] = sum(symbol.endswith("USDT") for symbol in symbols)
+    coverage["noncanonical_usdt_candidates"] = noncanonical_usdt
+    coverage["in_scope_crypto_perpetual_candidates"] = sum(
+        scope["product_scope"] in {"in_scope_crypto_perpetual", "benchmark_only"}
+        for scope in scope_by_identity.values()
+    )
     coverage["unresolved_categories"]["noncanonical_archive_identities"] = len(
         quarantined_prefixes
     )
     coverage["unresolved_categories"]["noncanonical_usdt_candidates"] = noncanonical_usdt
-    coverage["segments"]["delisted_or_archive_only"]["symbols"] += noncanonical_usdt
-    coverage["segments"]["delisted_or_archive_only"]["quarantined"] += (
-        noncanonical_usdt
-    )
     coverage["archive_index"] = {
         **symbol_audit,
         "raw_symbol_index_snapshots": [
@@ -206,6 +288,19 @@ def main() -> None:
         "all_symbol_month_pages_completed": True,
     }
     coverage["announcement_corpus"] = announcement_audit
+    coverage["scope_registry"] = {
+        "candidate_set_digest": scope_registry["candidate_set_digest"],
+        "stablecoin_positive_exclusions": len(
+            scope_registry["stablecoin_positive_exclusions"]
+        ),
+        "leveraged_token_positive_exclusions": len(
+            scope_registry["leveraged_token_positive_exclusions"]
+        ),
+        "noncrypto_index_composite_exclusions": len(
+            scope_registry["noncrypto_index_composite_exclusions"]
+        ),
+        "unresolved": len(scope_registry["unresolved_identities"]),
+    }
     coverage["exchange_info_provenance"] = {
         "sha256": exchange_sha256,
         "original_retrieval_timestamp": (
@@ -232,6 +327,11 @@ def main() -> None:
     write_bytes_exclusive(
         report_root / "announcement_evidence.json",
         _json_bytes(announcement_frame.to_dict("records")),
+    )
+    write_json_exclusive(report_root / "announcement_corpus_audit.json", announcement_audit)
+    write_json_exclusive(report_root / "historical_scope_registry.json", scope_registry)
+    write_bytes_exclusive(
+        report_root / "first_observed_trades.json", _json_bytes(first_trade_records)
     )
     write_bytes_exclusive(
         report_root / "lifecycle_catalog.json", _json_bytes(catalog.to_dict("records"))
@@ -260,12 +360,16 @@ def main() -> None:
     write_json_exclusive(
         report_root / "noncanonical_archive_prefix_queue.json",
         {
-            "status": "quarantined_fail_closed",
+            "status": "reviewed_finite_universe",
             "prefixes": quarantined_prefixes,
+            "dispositions": {
+                identity: scope_by_identity[identity]["product_scope"]
+                for identity in quarantined_prefixes
+            },
         },
     )
     classification_evidence = []
-    for row in exchange_records.to_dict("records"):
+    for row in scope_registry["records"]:
         for dimension, value_field, status_field, conflict_field in (
             (
                 "stablecoin_underlying",
@@ -282,17 +386,17 @@ def main() -> None:
         ):
             classification_evidence.append(
                 {
-                    "asset": row["base_asset"] if dimension == "stablecoin_underlying" else row["symbol"],
-                    "contract_identity": row["symbol"],
+                    "asset": row["base_asset"] if dimension == "stablecoin_underlying" else row["contract_identity"],
+                    "contract_identity": row["contract_identity"],
                     "dimension": dimension,
                     "value": row[value_field],
-                    "source_type": "official_exchange_info_or_frozen_positive_guard",
-                    "source_identifier": row["metadata_source"],
-                    "source_url": row["metadata_source"],
-                    "raw_snapshot_sha256": row["metadata_raw_snapshot_sha256"],
-                    "reviewed_parser_version": "classification-evidence-v1",
+                    "source_type": "candidate_set_bound_historical_scope_registry",
+                    "source_identifier": scope_registry["candidate_set_digest"],
+                    "source_url": EXCHANGE_INFO_URL,
+                    "raw_snapshot_sha256": exchange_sha256,
+                    "reviewed_parser_version": scope_registry["reviewer_parser_version"],
                     "evidence_status": row[status_field],
-                    "conflict_status": row[conflict_field],
+                    "conflict_status": "none",
                 }
             )
     write_bytes_exclusive(
@@ -342,7 +446,12 @@ def main() -> None:
         "former_false_positive_rejections_by_semantic_class": rejection_classes,
     }
     write_json_exclusive(report_root / "listing_reaudit.json", listing_reaudit)
-    readiness = catalog_readiness(catalog, quarantined_prefixes)
+    unresolved_noncanonical = [
+        identity
+        for identity in quarantined_prefixes
+        if scope_by_identity[identity]["scope_audit_status"] != "complete"
+    ]
+    readiness = catalog_readiness(catalog, unresolved_noncanonical)
     coverage["recomputed_readiness"] = readiness
     write_json_exclusive(report_root / "readiness.json", readiness)
     write_json_exclusive(report_root / "coverage.json", coverage)
@@ -376,6 +485,9 @@ def main() -> None:
             "archive_observations.json",
             "noncanonical_archive_prefix_queue.json",
             "readiness.json",
+            "historical_scope_registry.json",
+            "first_observed_trades.json",
+            "announcement_corpus_audit.json",
         ],
         code_commit=commit,
         created_at=datetime.now(UTC).isoformat(),

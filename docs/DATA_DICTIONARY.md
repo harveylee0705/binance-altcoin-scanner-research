@@ -15,7 +15,7 @@ logical fields below. Nullable means “unknown/not computable,” never silentl
 | `underlying_type` | string | Binance classification; v0.1 crypto scope requires `COIN` |
 | `underlying_subtype` | list[string] | Preserved Binance subtype tags |
 | `is_leveraged_token` | bool | Explicit classification, never inferred from a name suffix |
-| `classification_provenance` | string | Evidence/source for the instrument classification |
+| `classification_provenance` | string | Nonblank evidence/source; null means quarantine |
 | `onboard_timestamp` | timestamp | Official API onboard/listing field where preserved |
 | `first_valid_timestamp` | timestamp | First valid archived 1H open; observed lower data boundary |
 | `delisting_announcement_timestamp` | timestamp? | Official announcement publication time only |
@@ -89,6 +89,10 @@ Each object attempt records object key/URL, symbol, interval, period, retrieval 
 result, bytes, published checksum, computed checksum, verification status, coverage, row count,
 missing/duplicate counts, and error text. Raw ZIPs and metadata responses are append-only.
 
-Download attempts additionally retain `url`, `retrieved_at`, `payload_source`, parsed symbol,
-interval, period, and HTTP/cache result. Row coverage and missing-bar counts are added by the
-normalization/processing quality manifest because they require reading the verified archive.
+Download attempts additionally retain archive/checksum URLs, `retrieved_at`, `payload_source`,
+parsed symbol, interval, period, HTTP/cache result, failure stage/URL, and every available published
+or computed hash. Only a confirmed archive-object 404 is `missing`; checksum-sidecar absence and
+verification mismatch are failures. Row coverage and missing-bar counts are added by the
+normalization/processing quality manifest because they require reading the verified archive. An
+occupied raw path is never overwritten; a newly published mismatch is preserved as a structured
+failure so earlier manifest-to-byte lineage remains valid.

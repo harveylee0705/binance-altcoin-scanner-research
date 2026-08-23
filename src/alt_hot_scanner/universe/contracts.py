@@ -8,15 +8,15 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class ContractRecord:
-    symbol: str
-    base_asset: str
-    quote_asset: str
-    margin_asset: str
-    contract_type: str
-    underlying_type: str
-    underlying_subtype: tuple[str, ...]
-    is_leveraged_token: bool
-    classification_provenance: str
+    symbol: str | None
+    base_asset: str | None
+    quote_asset: str | None
+    margin_asset: str | None
+    contract_type: str | None
+    underlying_type: str | None
+    underlying_subtype: tuple[str, ...] | None
+    is_leveraged_token: bool | None
+    classification_provenance: str | None
     onboard_timestamp: pd.Timestamp | None
     first_valid_timestamp: pd.Timestamp | None = None
     delisting_announcement_timestamp: pd.Timestamp | None = None
@@ -35,19 +35,45 @@ def records_from_exchange_info(
     records: list[dict] = []
     for item in payload["symbols"]:
         delivery_ms = item.get("deliveryDate")
-        underlying_subtype = tuple(item.get("underlyingSubType", []))
+        raw_subtype = item.get("underlyingSubType")
+        valid_subtype = (
+            isinstance(raw_subtype, list)
+            and bool(raw_subtype)
+            and all(isinstance(value, str) and value.strip() for value in raw_subtype)
+        )
+        underlying_subtype = tuple(raw_subtype) if valid_subtype else None
+        classification_fields_valid = (
+            all(
+                isinstance(item.get(field), str) and item[field].strip()
+                for field in (
+                    "symbol",
+                    "baseAsset",
+                    "quoteAsset",
+                    "marginAsset",
+                    "contractType",
+                    "underlyingType",
+                )
+            )
+            and valid_subtype
+        )
         record = ContractRecord(
-            symbol=item["symbol"],
-            base_asset=item["baseAsset"],
-            quote_asset=item["quoteAsset"],
-            margin_asset=item["marginAsset"],
-            contract_type=item["contractType"],
-            underlying_type=item.get("underlyingType", ""),
+            symbol=item.get("symbol"),
+            base_asset=item.get("baseAsset"),
+            quote_asset=item.get("quoteAsset"),
+            margin_asset=item.get("marginAsset"),
+            contract_type=item.get("contractType"),
+            underlying_type=item.get("underlyingType"),
             underlying_subtype=underlying_subtype,
-            is_leveraged_token=any(
-                "LEVERAGED" in subtype.upper() for subtype in underlying_subtype
+            is_leveraged_token=(
+                any("LEVERAGED" in subtype.upper() for subtype in underlying_subtype)
+                if classification_fields_valid and underlying_subtype is not None
+                else None
             ),
-            classification_provenance="binance_exchange_info_underlying_classification",
+            classification_provenance=(
+                "binance_exchange_info_underlying_type_and_nonempty_subtype"
+                if classification_fields_valid
+                else None
+            ),
             onboard_timestamp=pd.to_datetime(item.get("onboardDate"), unit="ms", utc=True),
             delivery_timestamp=(
                 pd.to_datetime(delivery_ms, unit="ms", utc=True) if delivery_ms else None
@@ -71,6 +97,7 @@ def filter_instrument_scope(
         "margin_asset",
         "contract_type",
         "underlying_type",
+        "underlying_subtype",
         "is_leveraged_token",
         "classification_provenance",
     }
@@ -78,14 +105,29 @@ def filter_instrument_scope(
     if missing:
         raise ValueError(f"Instrument classification is unresolved; missing {sorted(missing)}")
     stable = set(stablecoin_underlyings)
-    base = metadata["base_asset"].astype(str)
+    symbol = metadata["symbol"].astype("string")
+    base = metadata["base_asset"].astype("string")
+    subtype_is_explicit = metadata["underlying_subtype"].map(
+        lambda value: (
+            isinstance(value, (tuple, list))
+            and bool(value)
+            and all(isinstance(item, str) and item.strip() for item in value)
+        )
+    )
+    provenance = metadata["classification_provenance"].astype("string")
     mask = (
-        metadata["quote_asset"].eq("USDT")
+        symbol.notna()
+        & symbol.str.strip().ne("")
+        & base.notna()
+        & base.str.strip().ne("")
+        & metadata["quote_asset"].eq("USDT")
         & metadata["margin_asset"].eq("USDT")
         & metadata["contract_type"].eq("PERPETUAL")
         & metadata["underlying_type"].eq("COIN")
         & ~base.isin(stable)
         & metadata["is_leveraged_token"].eq(False)
-        & metadata["classification_provenance"].notna()
+        & subtype_is_explicit
+        & provenance.notna()
+        & provenance.str.strip().ne("")
     )
     return metadata.loc[mask].copy()

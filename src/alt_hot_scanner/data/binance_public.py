@@ -19,6 +19,7 @@ INDEX_HOST = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
 class DownloadRecord:
     object_key: str
     url: str
+    checksum_url: str
     retrieved_at: str
     byte_count: int
     published_sha256: str
@@ -26,6 +27,29 @@ class DownloadRecord:
     checksum_verified: bool
     local_path: str
     payload_source: str
+
+
+class ArchiveAcquisitionError(RuntimeError):
+    """Structured failure that preserves acquisition stage and available checksum evidence."""
+
+    def __init__(
+        self,
+        object_key: str,
+        stage: str,
+        request_url: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+        published_sha256: str | None = None,
+        computed_sha256: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.object_key = object_key
+        self.stage = stage
+        self.request_url = request_url
+        self.status_code = status_code
+        self.published_sha256 = published_sha256
+        self.computed_sha256 = computed_sha256
 
 
 def _read_url(url: str, timeout: int = 60) -> bytes:
@@ -37,35 +61,119 @@ def _read_url(url: str, timeout: int = 60) -> bytes:
 def download_verified_archive(
     object_key: str,
     raw_root: str | Path,
-    *,
-    overwrite: bool = False,
 ) -> DownloadRecord:
-    """Download a Binance archive and verify its published SHA-256 sidecar."""
+    """Acquire a verified archive without ever overwriting an existing raw path."""
     url = f"{ARCHIVE_HOST}/{object_key.lstrip('/')}"
     checksum_url = f"{url}.CHECKSUM"
-    checksum_text = _read_url(checksum_url).decode("utf-8").strip()
+    try:
+        checksum_payload = _read_url(checksum_url)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            try:
+                archive_exists = object_exists(object_key)
+            except (OSError, urllib.error.URLError) as probe_exc:
+                raise ArchiveAcquisitionError(
+                    object_key,
+                    "archive_existence_probe",
+                    url,
+                    f"Could not distinguish missing archive from missing checksum: {probe_exc}",
+                ) from probe_exc
+            if not archive_exists:
+                raise ArchiveAcquisitionError(
+                    object_key,
+                    "archive_payload",
+                    url,
+                    "Archive object does not exist",
+                    status_code=404,
+                ) from exc
+        raise ArchiveAcquisitionError(
+            object_key,
+            "checksum_sidecar",
+            checksum_url,
+            f"Checksum sidecar request failed with HTTP {exc.code}",
+            status_code=exc.code,
+        ) from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise ArchiveAcquisitionError(
+            object_key,
+            "checksum_sidecar",
+            checksum_url,
+            f"Checksum sidecar request failed: {exc}",
+        ) from exc
+    try:
+        checksum_text = checksum_payload.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise ArchiveAcquisitionError(
+            object_key,
+            "checksum_parse",
+            checksum_url,
+            "Checksum sidecar is not valid UTF-8",
+        ) from exc
     match = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)", checksum_text)
     if not match:
-        raise ValueError(f"Unrecognized checksum sidecar for {object_key}: {checksum_text!r}")
+        raise ArchiveAcquisitionError(
+            object_key,
+            "checksum_parse",
+            checksum_url,
+            f"Unrecognized checksum sidecar: {checksum_text!r}",
+        )
     published = match.group(1).lower()
 
     destination = Path(raw_root) / object_key
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and not overwrite:
+    if destination.exists():
         payload = destination.read_bytes()
         payload_source = "existing_local_verified_against_published_checksum"
     else:
-        payload = _read_url(url)
-        destination.write_bytes(payload)
+        try:
+            payload = _read_url(url)
+        except urllib.error.HTTPError as exc:
+            raise ArchiveAcquisitionError(
+                object_key,
+                "archive_payload",
+                url,
+                f"Archive request failed with HTTP {exc.code}",
+                status_code=exc.code,
+                published_sha256=published,
+            ) from exc
+        except (OSError, urllib.error.URLError) as exc:
+            raise ArchiveAcquisitionError(
+                object_key,
+                "archive_payload",
+                url,
+                f"Archive request failed: {exc}",
+                published_sha256=published,
+            ) from exc
         payload_source = "downloaded_http_200"
     computed = hashlib.sha256(payload).hexdigest()
     if computed != published:
-        raise ValueError(
-            f"Checksum mismatch for {object_key}: published={published}, computed={computed}"
+        raise ArchiveAcquisitionError(
+            object_key,
+            "checksum_verification",
+            url,
+            f"Checksum mismatch: published={published}, computed={computed}",
+            published_sha256=published,
+            computed_sha256=computed,
         )
+    if not destination.exists():
+        try:
+            with destination.open("xb") as handle:
+                handle.write(payload)
+        except FileExistsError as exc:
+            existing_hash = hashlib.sha256(destination.read_bytes()).hexdigest()
+            if existing_hash != published:
+                raise ArchiveAcquisitionError(
+                    object_key,
+                    "immutable_path_conflict",
+                    str(destination),
+                    "Raw destination appeared concurrently with different bytes",
+                    published_sha256=published,
+                    computed_sha256=existing_hash,
+                ) from exc
     return DownloadRecord(
         object_key=object_key,
         url=url,
+        checksum_url=checksum_url,
         retrieved_at=datetime.now(UTC).isoformat(),
         byte_count=len(payload),
         published_sha256=published,

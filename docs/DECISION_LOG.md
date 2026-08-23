@@ -65,3 +65,16 @@ Reason: independent review found that callers could bypass scope filtering, legi
 contracts were excluded by suffix, and malformed/non-UTC close times could affect completed-bar and
 listing-age logic. No scanner outcomes informed these changes; they correct specification-enforcement
 and auditability defects.
+
+## 2026-08-23 — Milestone review remediation cycle 2 (final allowed cycle)
+
+Decision: treat missing, empty, null, malformed, or blank classification evidence as unresolved;
+require a nonempty official underlying-subtype list and nonblank provenance; and quarantine rather
+than infer. Remove the raw-archive overwrite parameter and verify bytes before exclusive creation.
+Introduce structured acquisition failures that distinguish archive absence, checksum-sidecar
+absence, checksum parsing, payload retrieval, verification mismatch, and immutable-path conflicts,
+while preserving every available hash and failing full processing on verification defects.
+
+Reason: remediation review 1 found the prior fix partial for malformed classification inputs and
+failure-path manifests, plus a direct raw overwrite bypass. These are implementation/auditability
+corrections made without inspecting scanner outcomes, validation, or holdout data.

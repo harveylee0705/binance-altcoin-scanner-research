@@ -38,6 +38,10 @@ rejected and counted. Duplicates, invalid OHLC relationships, negative volume, n
 checksum mismatch, and conflicting archive versions are hard errors requiring investigation. Monthly
 archives are retained exactly; archive updates can change checksums, so acquisition time and checksum
 must accompany reproducibility claims.
+If a published checksum changes, the existing raw object is not replaced. The acquisition fails with
+both hashes recorded; later work may add a separate content-addressed/versioned raw object without
+mutating the original path. Missing checksum sidecars are verification failures, not missing market
+data, unless a separate archive-object probe confirms a 404.
 Rolling features reset after a missing 4H boundary, outcome labels require an exact gap-free elapsed
 horizon, and a later HOT row after a gap starts a new episode.
 
@@ -58,6 +62,9 @@ remain quarantined rather than guessed into the universe.
 The reusable pipeline enforces this classification centrally. Leveraged-token status comes from
 explicit metadata/provenance; suffix matching is prohibited because it misclassifies legitimate
 assets such as JUP and SYRUP.
+Missing/null/empty/malformed underlying-subtype evidence or blank identity/provenance fields are
+quarantined. This is intentionally stricter than treating absence of a leveraged tag as proof of a
+normal crypto underlying.
 
 ## Statistical dependence and inference
 

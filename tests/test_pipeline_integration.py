@@ -28,6 +28,7 @@ def test_synthetic_end_to_end_vertical_slice() -> None:
                 "margin_asset": "USDT",
                 "contract_type": "PERPETUAL",
                 "underlying_type": "COIN",
+                "underlying_subtype": ("synthetic-crypto",),
                 "is_leveraged_token": False,
                 "classification_provenance": "synthetic_test_fixture",
                 "onboard_timestamp": pd.Timestamp("2020-01-01T00:00:00Z"),

@@ -8,7 +8,10 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from alt_hot_scanner.data.binance_public import download_verified_archive
+from alt_hot_scanner.data.binance_public import (
+    ArchiveAcquisitionError,
+    download_verified_archive,
+)
 
 
 def key_fields(object_key: str) -> dict[str, str]:
@@ -17,6 +20,44 @@ def key_fields(object_key: str) -> dict[str, str]:
     interval = parts[6]
     period = parts[-1].removeprefix(f"{symbol}-{interval}-").removesuffix(".zip")
     return {"symbol": symbol, "interval": interval, "period": period}
+
+
+def failure_attempt(object_key: str, exc: Exception) -> dict:
+    """Preserve failure stage and all checksum evidence; only archive 404 means missing."""
+    if isinstance(exc, ArchiveAcquisitionError):
+        status = (
+            "missing" if exc.stage == "archive_payload" and exc.status_code == 404 else "failed"
+        )
+        failure_stage = exc.stage
+        failure_url = exc.request_url
+        status_code = exc.status_code
+        published = exc.published_sha256
+        computed = exc.computed_sha256
+    else:
+        status = "failed"
+        failure_stage = "unclassified_local_or_request_failure"
+        failure_url = None
+        status_code = getattr(exc, "code", None)
+        published = None
+        computed = None
+    return {
+        "object_key": object_key,
+        "url": f"https://data.binance.vision/{object_key}",
+        "checksum_url": f"https://data.binance.vision/{object_key}.CHECKSUM",
+        **key_fields(object_key),
+        "status": status,
+        "retrieved_at": datetime.now(UTC).isoformat(),
+        "published_sha256": published,
+        "computed_sha256": computed,
+        "byte_count": None,
+        "local_path": None,
+        "checksum_verified": False,
+        "payload_source": None,
+        "http_result": status_code or "request_or_validation_failed",
+        "failure_stage": failure_stage,
+        "failure_url": failure_url,
+        "error": f"{type(exc).__name__}: {exc}",
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,35 +104,14 @@ def main() -> None:
                         **key_fields(key),
                         "status": "verified",
                         "http_result": record.payload_source,
+                        "failure_stage": None,
+                        "failure_url": None,
                         "error": None,
                     }
                 )
                 attempts.append(attempt)
-            except (OSError, ValueError, urllib.error.URLError) as exc:
-                status = (
-                    "missing"
-                    if isinstance(exc, urllib.error.HTTPError) and exc.code == 404
-                    else "failed"
-                )
-                attempts.append(
-                    {
-                        "object_key": key,
-                        "url": f"https://data.binance.vision/{key}",
-                        **key_fields(key),
-                        "status": status,
-                        "retrieved_at": datetime.now(UTC).isoformat(),
-                        "published_sha256": None,
-                        "computed_sha256": None,
-                        "byte_count": None,
-                        "local_path": None,
-                        "checksum_verified": False,
-                        "payload_source": None,
-                        "http_result": 404
-                        if status == "missing"
-                        else "request_or_validation_failed",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
+            except (ArchiveAcquisitionError, OSError, ValueError, urllib.error.URLError) as exc:
+                attempts.append(failure_attempt(key, exc))
 
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     manifest_path = raw_root / "manifests" / f"full_download_attempts_{run_id}.json"

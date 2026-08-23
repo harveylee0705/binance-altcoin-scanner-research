@@ -41,6 +41,9 @@ Scope classification is a mandatory pipeline invariant, not a caller convention.
 explicit quote asset, margin asset, contract type, underlying type, and leveraged-token evidence.
 Unresolved classification fails closed. Token-name suffixes such as `UP` are not classification
 evidence because legitimate assets (for example JUP and SYRUP) share those characters.
+For current `exchangeInfo`, classification evidence is valid only when the official underlying type
+and a nonempty, well-formed underlying-subtype list are both present; absent, null, empty, malformed,
+or blank fields quarantine that contract.
 
 Target coverage is 2020-01-01 through the latest fully completed available data; a contract begins
 only when it existed. Eligibility starts at the later of the official futures listing timestamp and

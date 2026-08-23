@@ -402,7 +402,9 @@ def acquire_announcement_corpus(
 
     def read_source(url: str, pattern: str) -> bytes:
         nonlocal network_request_count
-        existing = list(root.glob(pattern))
+        existing = [
+            path for path in root.glob(pattern) if not path.name.endswith(".provenance.json")
+        ]
         if len(existing) > 1:
             raise ValueError(f"Multiple raw snapshots match resume pattern {pattern}")
         if existing:

@@ -900,6 +900,27 @@ def acquire_first_observed_trade(
     )
 
 
+def verify_first_observed_trade_record(row: dict[str, Any]) -> None:
+    """Re-hash and reparse one persisted first-trade primitive for safe process parallelism."""
+    required = {
+        "symbol",
+        "published_sha256",
+        "computed_sha256",
+        "raw_path",
+        "earliest_trade_timestamp",
+    }
+    if type(row) is not dict or not required.issubset(row):
+        raise ValueError("First-observed-trade record is malformed")
+    require_archive_symbol_identity(row["symbol"], "first trade record symbol")
+    computed, _ = sha256_file(row["raw_path"])
+    if computed != row["computed_sha256"] or computed != row["published_sha256"]:
+        raise ValueError("First-observed-trade checkpoint checksum mismatch")
+    if parse_earliest_trade_timestamp(row["raw_path"]).isoformat() != row[
+        "earliest_trade_timestamp"
+    ]:
+        raise ValueError("First-observed-trade checkpoint timestamp mismatch")
+
+
 def discover_archive_symbol_candidates(
     *, page_observer: Callable[[int, str, bytes], None] | None = None
 ) -> ArchiveSymbolDiscovery:

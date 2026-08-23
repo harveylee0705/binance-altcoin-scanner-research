@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,8 +20,8 @@ from alt_hot_scanner.data.binance_public import (
     discover_archive_months,
     discover_archive_symbol_candidates,
     fetch_exchange_info_snapshot,
-    parse_earliest_trade_timestamp,
     sha256_file,
+    verify_first_observed_trade_record,
     write_bytes_exclusive,
     write_json_exclusive,
 )
@@ -214,17 +214,8 @@ def main() -> None:
         if sorted(row.get("symbol") for row in first_trade_records) != probe_symbols:
             raise ValueError("First-observed-trade checkpoint candidate identities changed")
 
-        def verify_trade_record(row: dict[str, Any]) -> None:
-            computed, _ = sha256_file(row["raw_path"])
-            if computed != row["computed_sha256"] or computed != row["published_sha256"]:
-                raise ValueError("First-observed-trade checkpoint checksum mismatch")
-            if parse_earliest_trade_timestamp(row["raw_path"]).isoformat() != row[
-                "earliest_trade_timestamp"
-            ]:
-                raise ValueError("First-observed-trade checkpoint timestamp mismatch")
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            list(executor.map(verify_trade_record, first_trade_records))
+        with ProcessPoolExecutor(max_workers=8) as executor:
+            list(executor.map(verify_first_observed_trade_record, first_trade_records))
     else:
         first_trade_records = []
         with ThreadPoolExecutor(max_workers=8) as executor:

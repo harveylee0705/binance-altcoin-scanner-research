@@ -60,9 +60,13 @@ def build_primitive_evidence_manifest(
     raw_root: str | Path,
     *,
     first_trades: list[dict[str, Any]],
+    episode_trades: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     root = Path(raw_root).resolve(strict=True)
-    trade_by_path = {str(Path(row["raw_path"]).resolve()): row for row in first_trades}
+    trade_by_path = {
+        str(Path(row["raw_path"]).resolve()): row
+        for row in [*first_trades, *(episode_trades or [])]
+    }
     entries: list[dict[str, Any]] = []
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
         relative = path.relative_to(root).as_posix()

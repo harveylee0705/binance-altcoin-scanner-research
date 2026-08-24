@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 import zipfile
 from datetime import timedelta
 from pathlib import Path
@@ -13,6 +14,10 @@ import pandas as pd
 
 ORACLE_REPORT_SCHEMA_VERSION = "independent-eligibility-oracle-report-v1"
 EPISODE_EVIDENCE_SCHEMA_VERSION = "lifecycle-episode-first-trade-evidence-v1"
+_DAILY_KEY = re.compile(
+    r"data/futures/um/daily/trades/(?P<symbol>[^/\\]+)/"
+    r"(?P=symbol)-trades-(?P<date>20\d\d-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))\.zip"
+)
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -45,10 +50,31 @@ def _iso(value: object) -> str | None:
     return pd.Timestamp(value).isoformat()
 
 
-def _earliest_trade(path: Path) -> str:
+def _cms_binding(audit: dict[str, Any]) -> dict[str, Any]:
+    catalogs = [
+        item for item in audit.get("catalogs", []) if item.get("event_type") == "delisting"
+    ]
+    if len(catalogs) != 1:
+        raise ValueError("Oracle requires one exact delisting CMS catalog")
+    catalog = catalogs[0]
+    stable = {
+        "schema_version": "binance-delisting-cms-corpus-v1",
+        "parser_version": audit.get("parser_version"),
+        "catalog_id": catalog.get("catalog_id"),
+        "declared_total": catalog.get("declared_total"),
+        "pages": catalog.get("pages"),
+        "candidate_articles": catalog.get("candidate_articles"),
+        "inspection_policy": catalog.get("inspection_policy"),
+        "page_sha256s": catalog.get("page_sha256s"),
+    }
+    digest = content_identity(stable)
+    return {"identity": digest, "sha256": digest, "delisting_catalog_id": catalog["catalog_id"]}
+
+
+def _earliest_trade(path: Path, expected_member: str) -> str:
     with zipfile.ZipFile(path) as archive:
         members = [item for item in archive.infolist() if not item.is_dir()]
-        if len(members) != 1 or not members[0].filename.endswith(".csv"):
+        if len(members) != 1 or members[0].filename != expected_member:
             raise ValueError("Oracle trade archive must contain exactly one CSV")
         minimum: int | None = None
         with archive.open(members[0]) as raw:
@@ -75,6 +101,7 @@ def derive_expected_eligibility(report_root: str | Path) -> dict[str, Any]:
     delisting = _load(root / "historical_delisting_cutoff_registry.json")
     boundaries = _load(root / "lifecycle_daily_trade_boundaries.json")
     primitive = _load(root / "primitive_evidence_manifest.json")
+    announcement_audit = _load(root / "announcement_corpus_audit.json")
 
     evidence_core = {
         key: value for key, value in episode_evidence.items() if key != "evidence_id"
@@ -91,6 +118,8 @@ def derive_expected_eligibility(report_root: str | Path) -> dict[str, Any]:
         or delisting.get("candidate_set_digest") != inventory["candidate_set_digest"]
     ):
         raise ValueError("Reviewed delisting registry identity is invalid")
+    if delisting.get("official_cms_corpus") != _cms_binding(announcement_audit):
+        raise ValueError("Reviewed delisting registry targets a stale CMS corpus")
     scope_by_symbol = {row["contract_identity"]: row for row in scope["records"]}
     adj_by_symbol = {row["symbol"]: row for row in adjudications["records"]}
     trade_by_episode = {
@@ -131,9 +160,25 @@ def derive_expected_eligibility(report_root: str | Path) -> dict[str, Any]:
             ):
                 conflict = "missing_or_invalid_verified_first_trade"
             elif (
-                str(Path(trade["raw_path"]).resolve()) not in primitive_by_path
+                (key_match := _DAILY_KEY.fullmatch(str(trade.get("archive_object_key")))) is None
+                or key_match.group("symbol") != symbol
+                or key_match.group("date") != trade.get("archive_date")
+                or str(Path(trade["raw_path"]).resolve()) not in primitive_by_path
                 or sha256_path(trade["raw_path"]) != trade["published_sha256"]
-                or _earliest_trade(Path(trade["raw_path"]))
+                or primitive_by_path[str(Path(trade["raw_path"]).resolve())].get(
+                    "evidence_role"
+                )
+                not in {"first_observed_trade_zip", "episode_first_observed_trade_zip"}
+                or primitive_by_path[str(Path(trade["raw_path"]).resolve())].get(
+                    "source_identifier"
+                )
+                != trade["archive_object_key"]
+                or primitive_by_path[str(Path(trade["raw_path"]).resolve())].get("sha256")
+                != trade["published_sha256"]
+                or _earliest_trade(
+                    Path(trade["raw_path"]),
+                    f"{symbol}-trades-{trade['archive_date']}.csv",
+                )
                 != _iso(trade["earliest_trade_timestamp"])
             ):
                 conflict = "episode_trade_primitive_verification_failed"
@@ -174,6 +219,14 @@ def derive_expected_eligibility(report_root: str | Path) -> dict[str, Any]:
                     ),
                     "delisting_article_id": None if cutoff is None else cutoff.get("article_code"),
                     "last_trading_at": terminal,
+                    "eligibility_end_at": (
+                        None
+                        if cutoff is None and terminal is None
+                        else _iso(cutoff.get("official_publication_timestamp"))
+                        if cutoff is not None
+                        and cutoff.get("official_publication_timestamp") is not None
+                        else terminal
+                    ),
                     "conflict": conflict,
                 }
             )
@@ -212,6 +265,7 @@ def compare_production_catalog(expected: dict[str, Any], catalog: list[dict[str,
                 "delisting_announcement_published_at",
                 "delisting_article_id",
                 "last_trading_at",
+                "eligibility_end_at",
             ):
                 actual_value = actual_episode.get(field)
                 expected_value = expected_episode.get(field)
@@ -220,6 +274,7 @@ def compare_production_catalog(expected: dict[str, Any], catalog: list[dict[str,
                     "eligible_from",
                     "delisting_announcement_published_at",
                     "last_trading_at",
+                    "eligibility_end_at",
                 }:
                     actual_value = _iso(actual_value)
                     expected_value = _iso(expected_value)

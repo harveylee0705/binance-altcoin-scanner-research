@@ -36,7 +36,15 @@ def test_synthetic_end_to_end_vertical_slice() -> None:
                 "is_leveraged_token": False,
                 "scope_classification_status": "resolved_synthetic_fixture",
                 "scope_classification_provenance": "synthetic_test_fixture",
-                "official_trading_start_at": pd.Timestamp("2020-01-01T00:00:00Z"),
+                    "official_trading_start_at": pd.Timestamp("2020-01-01T00:00:00Z"),
+                    "eligibility_age_anchor_at": pd.Timestamp("2020-01-01T00:00:00Z"),
+                    "eligibility_age_anchor_basis": (
+                        "first_observed_binance_futures_trade"
+                    ),
+                    "first_observed_trade_at": pd.Timestamp("2020-01-01T00:00:00Z"),
+                    "first_observed_trade_evidence_status": (
+                        "checksum_verified_official_binance_futures_trade"
+                    ),
                 "delisting_announcement_published_at": pd.NaT,
             }
         )

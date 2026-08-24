@@ -47,7 +47,10 @@ from alt_hot_scanner.universe.checkpoint import (
     verify_archive_checkpoint,
 )
 from alt_hot_scanner.universe.contracts import records_from_exchange_info
-from alt_hot_scanner.universe.delisting_registry import load_delisting_registry
+from alt_hot_scanner.universe.delisting_registry import (
+    load_delisting_registry,
+    verify_cms_corpus_binding,
+)
 from alt_hot_scanner.universe.eligibility_oracle import (
     EPISODE_EVIDENCE_SCHEMA_VERSION,
     content_identity,
@@ -379,6 +382,7 @@ def main() -> None:
     announcement_frame, announcement_audit = acquire_announcement_corpus(
         raw_root / "announcements", set(symbols)
     )
+    verify_cms_corpus_binding(delisting_registry, announcement_audit)
     catalog = build_lifecycle_catalog(
         archive_frame,
         exchange_records,
@@ -646,7 +650,9 @@ def main() -> None:
         },
     )
     primitive_manifest = build_primitive_evidence_manifest(
-        raw_root, first_trades=first_trade_records
+        raw_root,
+        first_trades=first_trade_records,
+        episode_trades=episode_trade_records,
     )
     write_json_exclusive(
         report_root / "primitive_evidence_manifest.json", primitive_manifest

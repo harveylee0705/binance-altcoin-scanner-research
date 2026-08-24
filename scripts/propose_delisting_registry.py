@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from alt_hot_scanner.universe.delisting_registry import DELISTING_REGISTRY_SCHEMA_VERSION
+from alt_hot_scanner.universe.delisting_registry import (
+    DELISTING_REGISTRY_SCHEMA_VERSION,
+    cms_corpus_binding,
+)
 
 
 def _identity(value: Any) -> str:
@@ -75,15 +78,7 @@ def main() -> None:
     core = {
         "schema_version": DELISTING_REGISTRY_SCHEMA_VERSION,
         "candidate_set_digest": inventory["candidate_set_digest"],
-        "official_cms_corpus": {
-            "identity": _identity(audit),
-            "sha256": hashlib.sha256(audit_path.read_bytes()).hexdigest(),
-            "delisting_catalog_id": next(
-                item["catalog_id"]
-                for item in audit["catalogs"]
-                if item["event_type"] == "delisting"
-            ),
-        },
+        "official_cms_corpus": cms_corpus_binding(audit),
         "reviewed_contract_identities": sorted(in_scope),
         "review_version": "delisting-cutoff-finite-universe-review-v1",
         "records": records,

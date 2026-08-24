@@ -2,8 +2,8 @@
   "candidate_set_digest": "b323b3c3ba1010654d9ce1a47325364f7c7e624624857554b7e945f38f91c445",
   "official_cms_corpus": {
     "delisting_catalog_id": 161,
-    "identity": "2903d3a7fae806b3c09e79a065f8b7c6227cf68ba87bc02deb5d95ecce2e8f2c",
-    "sha256": "1926d982770cdf0d9dee1d1376133ddc4133465e111b287385723663971b3746"
+    "identity": "35da97a0886b740a3d447ce875cbbffbe71684b1bffe174e679a889e10196a7a",
+    "sha256": "35da97a0886b740a3d447ce875cbbffbe71684b1bffe174e679a889e10196a7a"
   },
   "records": [
     {
@@ -8191,7 +8191,7 @@
       "terminal_last_trading_at": null
     }
   ],
-  "registry_id": "c25106b2bba04a4bd882a5a1a765838f99ecee77c3a0a72076ca73d52197cd17",
+  "registry_id": "7cd4c03ee78f988bc52a1f341791d0009f50e308b2a82d27ce298f1ce27cba15",
   "review_version": "delisting-cutoff-finite-universe-review-v1",
   "reviewed_contract_identities": [
     "0GUSDT",

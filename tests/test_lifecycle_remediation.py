@@ -30,8 +30,10 @@ from alt_hot_scanner.universe.authorization import (
     verify_lifecycle_bundle,
 )
 from alt_hot_scanner.universe.contracts import records_from_exchange_info
+from alt_hot_scanner.universe.delisting_registry import cms_corpus_binding
 from alt_hot_scanner.universe.eligibility_oracle import (
     compare_production_catalog,
+    derive_expected_eligibility,
     run_eligibility_oracle,
 )
 from alt_hot_scanner.universe.lifecycle import (
@@ -573,19 +575,22 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
     registry["registry_id"] = scope_registry_identity(registry)
     (tmp_path / "historical_scope_registry.json").write_text(json.dumps(registry))
     (tmp_path / "first_observed_trades.json").write_text(json.dumps([trade]))
-    (tmp_path / "announcement_corpus_audit.json").write_text(
-        json.dumps(
+    announcement_audit = {
+        "parser_version": "fixture-parser-v1",
+        "catalogs": [
             {
-                "catalogs": [
-                    {
-                        "event_type": "delisting",
-                        "inspection_policy": "complete_catalog_detail_inspection",
-                        "candidate_articles": 0,
-                        "declared_total": 0,
-                    }
-                ]
+                "catalog_id": 161,
+                "event_type": "delisting",
+                "inspection_policy": "complete_catalog_detail_inspection",
+                "candidate_articles": 0,
+                "declared_total": 0,
+                "pages": 0,
+                "page_sha256s": [],
             }
-        )
+        ],
+    }
+    (tmp_path / "announcement_corpus_audit.json").write_text(
+        json.dumps(announcement_audit)
     )
     inventory = {
         "candidate_set_digest": registry["candidate_set_digest"],
@@ -617,7 +622,7 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
     delisting_core = {
         "schema_version": "historical-delisting-cutoff-registry-v1",
         "candidate_set_digest": registry["candidate_set_digest"],
-        "official_cms_corpus": {"identity": "fixture", "sha256": "e" * 64},
+        "official_cms_corpus": cms_corpus_binding(announcement_audit),
         "reviewed_contract_identities": ["AAAUSDT"],
         "review_version": "fixture-v1",
         "records": [cutoff],
@@ -867,6 +872,7 @@ def _two_episode_oracle_fixture() -> tuple[dict, list[dict]]:
         "exact_listing_leak",
         "missing_relist_age_reset",
         "gap_continuity",
+        "runtime_effective_end",
         "wrong_delisting_article",
         "wrong_delisting_time",
         "wrong_delisting_symbol",
@@ -888,6 +894,8 @@ def test_independent_oracle_rejects_production_lifecycle_mutations(mutation: str
         intervals[1]["eligible_from"] = intervals[1]["age_live_anchor_at"]
     elif mutation == "gap_continuity":
         intervals[0]["last_trading_at"] = None
+    elif mutation == "runtime_effective_end":
+        intervals[0]["eligibility_end_at"] = intervals[0]["last_trading_at"]
     elif mutation == "wrong_delisting_article":
         intervals[0]["delisting_article_id"] = "wrong-article"
     elif mutation == "wrong_delisting_time":
@@ -975,3 +983,42 @@ def test_oracle_module_has_no_production_parser_or_builder_dependency() -> None:
     ).read_text("utf-8")
     assert "parse_announcement_evidence" not in source
     assert "build_lifecycle_catalog" not in source
+
+
+@pytest.mark.parametrize("mutation", ["wrong_symbol_archive", "wrong_manifest_lineage"])
+def test_oracle_rejects_mislabeled_trade_primitive(
+    tmp_path: Path, mutation: str
+) -> None:
+    _write_bundle(tmp_path)
+    episode_path = tmp_path / "episode_first_observed_trades.json"
+    episode = json.loads(episode_path.read_text())
+    if mutation == "wrong_symbol_archive":
+        episode["records"][0]["archive_object_key"] = (
+            "data/futures/um/daily/trades/BBBUSDT/BBBUSDT-trades-2020-01-01.zip"
+        )
+    else:
+        primitive_path = tmp_path / "primitive_evidence_manifest.json"
+        primitive = json.loads(primitive_path.read_text())
+        primitive["entries"][0]["source_identifier"] = "wrong-archive"
+        primitive_core = {
+            key: value for key, value in primitive.items() if key != "manifest_id"
+        }
+        primitive["manifest_id"] = content_identity(primitive_core)
+        primitive_path.write_text(json.dumps(primitive))
+    episode_core = {key: value for key, value in episode.items() if key != "evidence_id"}
+    episode["evidence_id"] = content_identity(episode_core)
+    episode_path.write_text(json.dumps(episode))
+    derived = derive_expected_eligibility(tmp_path)
+    assert derived["blocker_symbols"] == ["AAAUSDT"]
+
+
+def test_oracle_rejects_stale_reviewed_cms_corpus(tmp_path: Path) -> None:
+    _write_bundle(tmp_path)
+    registry_path = tmp_path / "historical_delisting_cutoff_registry.json"
+    registry = json.loads(registry_path.read_text())
+    registry["official_cms_corpus"]["identity"] = "0" * 64
+    registry_core = {key: value for key, value in registry.items() if key != "registry_id"}
+    registry["registry_id"] = content_identity(registry_core)
+    registry_path.write_text(json.dumps(registry))
+    with pytest.raises(ValueError, match="stale CMS corpus"):
+        derive_expected_eligibility(tmp_path)

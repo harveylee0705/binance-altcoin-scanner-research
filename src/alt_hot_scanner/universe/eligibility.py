@@ -19,18 +19,30 @@ def apply_point_in_time_eligibility(
         "symbol",
         "delisting_announcement_published_at",
         "scope_classification_status",
+        "eligibility_age_anchor_at",
+        "eligibility_age_anchor_basis",
+        "first_observed_trade_at",
+        "first_observed_trade_evidence_status",
     }
     missing = required - set(contracts.columns)
     if missing:
         raise ValueError(f"Contract metadata is missing {sorted(missing)}")
     contracts = contracts.copy()
-    if "eligibility_age_anchor_at" not in contracts.columns:
-        if "official_trading_start_at" not in contracts.columns:
-            raise ValueError("Contract metadata lacks an eligibility-age anchor")
-        contracts["eligibility_age_anchor_at"] = contracts["official_trading_start_at"]
-        contracts["eligibility_age_anchor_basis"] = contracts[
-            "official_trading_start_at"
-        ].map(lambda value: "exact_official_original_launch" if pd.notna(value) else "unresolved")
+    verified = (
+        contracts["eligibility_age_anchor_basis"].eq(
+            "first_observed_binance_futures_trade"
+        )
+        & contracts["first_observed_trade_evidence_status"].eq(
+            "checksum_verified_official_binance_futures_trade"
+        )
+        & pd.to_datetime(
+            contracts["eligibility_age_anchor_at"], utc=True, format="mixed"
+        ).eq(
+            pd.to_datetime(contracts["first_observed_trade_at"], utc=True, format="mixed")
+        )
+    )
+    if not verified.all():
+        raise ValueError("Contract metadata lacks an exact verified first-trade age anchor")
     for source_name, values in (("bars", bars["symbol"]), ("contracts", contracts["symbol"])):
         validated_symbols: set[str] = set()
         for position, value in enumerate(values):
@@ -83,13 +95,8 @@ def apply_point_in_time_eligibility(
     age_anchor = pd.to_datetime(result["eligibility_age_anchor_at"], utc=True, format="mixed")
     age = signal_time - age_anchor
     result["contract_age_days"] = age.dt.total_seconds() / 86_400
-    has_listing_evidence = age_anchor.notna() & result["eligibility_age_anchor_basis"].isin(
-        [
-            "exact_official_original_launch",
-            "exact_official_relisting_launch",
-            "first_observed_binance_futures_trade",
-            "legacy_pre_research_start_adjudicated",
-        ]
+    has_listing_evidence = age_anchor.notna() & result["eligibility_age_anchor_basis"].eq(
+        "first_observed_binance_futures_trade"
     )
     old_enough = age >= pd.Timedelta(days=minimum_age_days)
     announced = pd.to_datetime(

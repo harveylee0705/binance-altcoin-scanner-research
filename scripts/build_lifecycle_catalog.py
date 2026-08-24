@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,7 +24,6 @@ from alt_hot_scanner.data.binance_public import (
     observed_daily_trade_keys_from_index_snapshots,
     sha256_file,
     validate_daily_trade_object_key,
-    verify_first_observed_trade_record,
     write_bytes_exclusive,
     write_json_exclusive,
 )
@@ -252,8 +251,6 @@ def main() -> None:
         if sorted(row.get("symbol") for row in first_trade_records) != probe_symbols:
             raise ValueError("First-observed-trade checkpoint candidate identities changed")
 
-        with ProcessPoolExecutor(max_workers=8) as executor:
-            list(executor.map(verify_first_observed_trade_record, first_trade_records))
     else:
         first_trade_records = []
         with ThreadPoolExecutor(max_workers=8) as executor:

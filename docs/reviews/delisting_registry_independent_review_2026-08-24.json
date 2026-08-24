@@ -1,0 +1,12 @@
+{
+  "accepted_cutoffs_individually_inspected": true,
+  "accepted_exact_cutoff_count": 81,
+  "implementation_commit": "3a7c48f999f61d4da7b810852cbb4c9b915d5534",
+  "registry_id": "7cd4c03ee78f988bc52a1f341791d0009f50e308b2a82d27ce298f1ce27cba15",
+  "registry_sha256": "721f7c0b0674dddc9be677dae8631f7cde199963d40cb40f0415a2b1aa6b85fb",
+  "review_id": "28013672b5690fa28dbe1c67cb4f7814dd22c523921a9bbc76d95ecd617acc62",
+  "review_summary": "Independent milestone review inspected all 81 exact cutoffs; two bounded remediation cycles closed oracle/runtime binding findings; final verdict PASS with no findings.",
+  "reviewed_episode_count": 682,
+  "schema_version": "historical-delisting-cutoff-review-v1",
+  "verdict": "PASS"
+}

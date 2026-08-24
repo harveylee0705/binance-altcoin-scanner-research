@@ -15,6 +15,7 @@ import pandas as pd
 from alt_hot_scanner.data.announcements import acquire_announcement_corpus
 from alt_hot_scanner.data.binance_public import (
     INDEX_HOST,
+    acquire_episode_first_observed_trade,
     acquire_first_observed_trade,
     collision_resistant_run_id,
     discover_archive_months,
@@ -46,9 +47,14 @@ from alt_hot_scanner.universe.checkpoint import (
     verify_archive_checkpoint,
 )
 from alt_hot_scanner.universe.contracts import records_from_exchange_info
+from alt_hot_scanner.universe.delisting_registry import load_delisting_registry
+from alt_hot_scanner.universe.eligibility_oracle import (
+    EPISODE_EVIDENCE_SCHEMA_VERSION,
+    content_identity,
+    run_eligibility_oracle,
+)
 from alt_hot_scanner.universe.evidence_replay import (
     build_primitive_evidence_manifest,
-    run_full_evidence_replay,
 )
 from alt_hot_scanner.universe.lifecycle import build_lifecycle_catalog, catalog_coverage
 from alt_hot_scanner.universe.scope_registry import (
@@ -73,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adjudications", required=True, help="Exact reviewed lifecycle adjudication file"
     )
+    parser.add_argument("--delisting-registry", required=True)
+    parser.add_argument("--delisting-review", required=True)
     return parser.parse_args()
 
 
@@ -217,6 +225,13 @@ def main() -> None:
         Path(args.adjudications),
         candidate_set_digest=candidate_inventory["candidate_set_digest"],
     )
+    delisting_registry_path = Path(args.delisting_registry).resolve(strict=True)
+    delisting_review_path = Path(args.delisting_review).resolve(strict=True)
+    delisting_registry = load_delisting_registry(
+        delisting_registry_path,
+        candidate_set_digest=candidate_inventory["candidate_set_digest"],
+        review_path=delisting_review_path,
+    )
     unicode_in_scope = [
         identity
         for identity in quarantined_prefixes
@@ -320,6 +335,47 @@ def main() -> None:
         )
     verify_boundary_index(lifecycle_adjudications, boundary_rows)
 
+    first_trade_by_symbol = {row["symbol"]: row for row in first_trade_records}
+    boundary_by_symbol = {row["symbol"]: row for row in boundary_rows}
+    episode_trade_records: list[dict[str, Any]] = []
+    for symbol in probe_symbols:
+        adjudication = lifecycle_adjudications["by_symbol"].get(symbol)
+        specs = adjudication["episodes"] if adjudication else [{"episode_id": f"{symbol}:1"}]
+        for position, spec in enumerate(specs):
+            if position == 0:
+                episode_trade_records.append(
+                    {**first_trade_by_symbol[symbol], "lifecycle_episode_id": spec["episode_id"]}
+                )
+                continue
+            archive_date = adjudication["gap_evidence"][
+                "first_post_gap_trade_archive_date"
+            ]
+            keys = [
+                key
+                for key in boundary_by_symbol[symbol]["observed_archive_keys"]
+                if validate_daily_trade_object_key(key).period == archive_date
+            ]
+            if len(keys) != 1:
+                raise ValueError(f"Reviewed post-gap archive is not unique for {symbol}")
+            episode_trade_records.append(
+                acquire_episode_first_observed_trade(
+                    symbol,
+                    keys[0],
+                    raw_root / "trade_probe",
+                    episode_id=spec["episode_id"],
+                )
+            )
+    episode_trade_records.sort(key=lambda row: row["lifecycle_episode_id"])
+    episode_evidence_core = {
+        "schema_version": EPISODE_EVIDENCE_SCHEMA_VERSION,
+        "candidate_set_digest": candidate_inventory["candidate_set_digest"],
+        "records": episode_trade_records,
+    }
+    episode_evidence = {
+        **episode_evidence_core,
+        "evidence_id": content_identity(episode_evidence_core),
+    }
+
     announcement_frame, announcement_audit = acquire_announcement_corpus(
         raw_root / "announcements", set(symbols)
     )
@@ -329,6 +385,8 @@ def main() -> None:
         announcement_frame,
         announcement_search_completed=True,
         first_observed_trades=first_trade_frame,
+        episode_first_observed_trades=episode_trade_records,
+        delisting_registry_records=delisting_registry["records"],
         scope_registry_records=scope_registry["records"],
         lifecycle_adjudications=lifecycle_adjudications,
     )
@@ -430,6 +488,17 @@ def main() -> None:
     )
     write_bytes_exclusive(
         report_root / "first_observed_trades.json", _json_bytes(first_trade_records)
+    )
+    write_json_exclusive(
+        report_root / "episode_first_observed_trades.json", episode_evidence
+    )
+    write_bytes_exclusive(
+        report_root / "historical_delisting_cutoff_registry.json",
+        delisting_registry_path.read_bytes(),
+    )
+    write_bytes_exclusive(
+        report_root / "delisting_registry_independent_review.json",
+        delisting_review_path.read_bytes(),
     )
     write_bytes_exclusive(
         report_root / "lifecycle_catalog.json", _json_bytes(catalog.to_dict("records"))
@@ -582,14 +651,6 @@ def main() -> None:
     write_json_exclusive(
         report_root / "primitive_evidence_manifest.json", primitive_manifest
     )
-    full_replay = run_full_evidence_replay(
-        report_root,
-        repository_root=root,
-        lifecycle_adjudications=lifecycle_adjudications,
-    )
-    write_json_exclusive(
-        report_root / "full_evidence_verification_report.json", full_replay
-    )
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=root,
@@ -597,6 +658,15 @@ def main() -> None:
         capture_output=True,
         text=True,
     ).stdout.strip()
+    oracle_report = run_eligibility_oracle(
+        report_root,
+        repository_root=root,
+        config_path=config_path,
+        executable_commit=commit,
+    )
+    write_json_exclusive(
+        report_root / "independent_eligibility_verification_report.json", oracle_report
+    )
     bundle = build_bundle_payload(
         report_root=report_root,
         config_path=config_path,
@@ -610,12 +680,15 @@ def main() -> None:
             "readiness.json",
             "historical_scope_registry.json",
             "first_observed_trades.json",
+            "episode_first_observed_trades.json",
+            "historical_delisting_cutoff_registry.json",
+            "delisting_registry_independent_review.json",
             "announcement_corpus_audit.json",
             "candidate_inventory.json",
             "lifecycle_adjudications.json",
             "lifecycle_daily_trade_boundaries.json",
             "primitive_evidence_manifest.json",
-            "full_evidence_verification_report.json",
+            "independent_eligibility_verification_report.json",
         ],
         code_commit=commit,
         created_at=datetime.now(UTC).isoformat(),

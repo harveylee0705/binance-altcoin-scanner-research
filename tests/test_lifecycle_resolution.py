@@ -115,7 +115,7 @@ def _trade(at: str) -> pd.DataFrame:
     )
 
 
-def test_exact_launch_preferred_and_observed_trade_is_not_relabelled_exact() -> None:
+def test_exact_launch_is_descriptive_and_observed_trade_controls_age() -> None:
     catalog = build_lifecycle_catalog(
         _archive(),
         pd.DataFrame(),
@@ -125,7 +125,8 @@ def test_exact_launch_preferred_and_observed_trade_is_not_relabelled_exact() -> 
         announcement_search_completed=True,
     )
     row = catalog.iloc[0]
-    assert row["eligibility_age_anchor_basis"] == "exact_official_original_launch"
+    assert row["eligibility_age_anchor_basis"] == "first_observed_binance_futures_trade"
+    assert row["eligibility_age_anchor_at"] == "2021-01-01T00:00:01+00:00"
     assert row["exact_official_trading_start_at"] == "2021-01-01T00:00:00+00:00"
     assert row["first_observed_trade_at"] == "2021-01-01T00:00:01+00:00"
 
@@ -164,7 +165,10 @@ def test_observed_trade_anchor_age_rule_conflict_and_legacy_policy() -> None:
         scope_registry_records=_scope(),
         announcement_search_completed=True,
     )
-    assert conflict.iloc[0]["eligibility_age_anchor_basis"] == "unresolved"
+    assert conflict.iloc[0]["eligibility_age_anchor_basis"] == (
+        "first_observed_binance_futures_trade"
+    )
+    assert conflict.iloc[0]["eligibility_age_anchor_at"] == "2021-01-01T00:00:00+00:00"
     assert conflict.iloc[0]["age_anchor_conflict_status"] == (
         "first_observed_trade_precedes_claimed_exact_launch"
     )

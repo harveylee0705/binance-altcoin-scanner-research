@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -27,6 +30,10 @@ from alt_hot_scanner.universe.authorization import (
     verify_lifecycle_bundle,
 )
 from alt_hot_scanner.universe.contracts import records_from_exchange_info
+from alt_hot_scanner.universe.eligibility_oracle import (
+    compare_production_catalog,
+    run_eligibility_oracle,
+)
 from alt_hot_scanner.universe.lifecycle import (
     build_lifecycle_catalog,
     catalog_coverage,
@@ -408,8 +415,45 @@ def test_completed_delisting_search_without_timestamp_does_not_remove_history() 
     archives = pd.DataFrame([_archive("AAAUSDT"), _archive("BBBUSDT")])
     current = pd.DataFrame([_current("AAAUSDT", "TRADING"), _current("BBBUSDT", "SETTLING")])
     evidence = pd.DataFrame([_listing("AAAUSDT"), _listing("BBBUSDT")])
+    trades = pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "archive_object_key": f"data/futures/um/daily/trades/{symbol}/{symbol}-trades-2020-01-01.zip",
+                "published_sha256": "d" * 64,
+                "computed_sha256": "d" * 64,
+                "raw_path": f"/{symbol}.zip",
+                "original_retrieval_timestamp": None,
+                "earliest_trade_timestamp": "2020-01-01T00:00:01+00:00",
+                "parser_version": "test",
+                "evidence_status": "checksum_verified_official_binance_futures_trade",
+            }
+            for symbol in ("AAAUSDT", "BBBUSDT")
+        ]
+    )
+    registry = [
+        {
+            "symbol": symbol,
+            "lifecycle_episode_id": f"{symbol}:1",
+            "official_publication_timestamp": None,
+            "terminal_last_trading_at": None,
+            "official_article_url": None,
+            "article_code": None,
+            "raw_article_sha256": None,
+            "review_status": status,
+        }
+        for symbol, status in (
+            ("AAAUSDT", "not_applicable_current_episode"),
+            ("BBBUSDT", "reviewed_no_reliable_cutoff"),
+        )
+    ]
     catalog = build_lifecycle_catalog(
-        archives, current, evidence, announcement_search_completed=True
+        archives,
+        current,
+        evidence,
+        announcement_search_completed=True,
+        first_observed_trades=trades,
+        delisting_registry_records=registry,
     ).set_index("symbol")
     assert catalog.loc["AAAUSDT", "historical_inclusion_readiness"] == "ready"
     assert catalog.loc["AAAUSDT", "delisting_evidence_state"] == "not_applicable_currently_trading"
@@ -423,11 +467,50 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
     (tmp_path / "config").mkdir()
     review_dir = tmp_path / "docs" / "reviews"
     review_dir.mkdir(parents=True)
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    trade_path = raw_dir / "AAAUSDT.zip"
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr(
+            "AAAUSDT-trades-2020-01-01.csv",
+            "id,price,qty,quote_qty,time\n1,1,1,1,1577836801000\n",
+        )
+    trade_path.write_bytes(payload.getvalue())
+    trade_hash = hashlib.sha256(payload.getvalue()).hexdigest()
+    trade = {
+        "symbol": "AAAUSDT",
+        "archive_object_key": (
+            "data/futures/um/daily/trades/AAAUSDT/AAAUSDT-trades-2020-01-01.zip"
+        ),
+        "archive_date": "2020-01-01",
+        "published_sha256": trade_hash,
+        "computed_sha256": trade_hash,
+        "raw_path": str(trade_path.resolve()),
+        "original_retrieval_timestamp": "2026-01-01T00:00:00+00:00",
+        "earliest_trade_timestamp": "2020-01-01T00:00:01+00:00",
+        "parser_version": "test",
+        "evidence_status": "checksum_verified_official_binance_futures_trade",
+    }
+    cutoff = {
+        "symbol": "AAAUSDT",
+        "lifecycle_episode_id": "AAAUSDT:1",
+        "article_code": None,
+        "official_article_url": None,
+        "raw_article_sha256": None,
+        "official_publication_timestamp": None,
+        "terminal_last_trading_at": None,
+        "product_event_disposition": None,
+        "review_status": "not_applicable_current_episode",
+        "evidence_summary": "Current episode.",
+    }
     catalog = build_lifecycle_catalog(
         pd.DataFrame([_archive("AAAUSDT")]),
         pd.DataFrame([_current("AAAUSDT", "TRADING")]),
         pd.DataFrame([_listing("AAAUSDT")]),
         announcement_search_completed=True,
+        first_observed_trades=pd.DataFrame([trade]),
+        delisting_registry_records=[cutoff],
     )
     records = catalog.to_dict("records")
     (tmp_path / "lifecycle_catalog.json").write_text(json.dumps(records, default=str))
@@ -489,7 +572,7 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
     }
     registry["registry_id"] = scope_registry_identity(registry)
     (tmp_path / "historical_scope_registry.json").write_text(json.dumps(registry))
-    (tmp_path / "first_observed_trades.json").write_text("[]")
+    (tmp_path / "first_observed_trades.json").write_text(json.dumps([trade]))
     (tmp_path / "announcement_corpus_audit.json").write_text(
         json.dumps(
             {
@@ -523,21 +606,60 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
         )
     )
     (tmp_path / "lifecycle_daily_trade_boundaries.json").write_text("[]")
-    primitive_core = {"schema_version": "primitive-evidence-manifest-v1", "entries": []}
-    (tmp_path / "primitive_evidence_manifest.json").write_text(
-        json.dumps({**primitive_core, "manifest_id": content_identity(primitive_core)})
-    )
-    replay_core = {
-        "schema_version": "lifecycle-full-evidence-replay-v1",
-        "status": "PASS",
+    episode_core = {
+        "schema_version": "lifecycle-episode-first-trade-evidence-v1",
+        "candidate_set_digest": registry["candidate_set_digest"],
+        "records": [{**trade, "lifecycle_episode_id": "AAAUSDT:1"}],
     }
-    (tmp_path / "full_evidence_verification_report.json").write_text(
+    (tmp_path / "episode_first_observed_trades.json").write_text(
+        json.dumps({**episode_core, "evidence_id": content_identity(episode_core)})
+    )
+    delisting_core = {
+        "schema_version": "historical-delisting-cutoff-registry-v1",
+        "candidate_set_digest": registry["candidate_set_digest"],
+        "official_cms_corpus": {"identity": "fixture", "sha256": "e" * 64},
+        "reviewed_contract_identities": ["AAAUSDT"],
+        "review_version": "fixture-v1",
+        "records": [cutoff],
+    }
+    delisting_payload = {
+        **delisting_core,
+        "registry_id": content_identity(delisting_core),
+    }
+    delisting_path = tmp_path / "historical_delisting_cutoff_registry.json"
+    delisting_path.write_text(json.dumps(delisting_payload))
+    delisting_review_core = {
+        "schema_version": "historical-delisting-cutoff-review-v1",
+        "verdict": "PASS",
+        "registry_id": delisting_payload["registry_id"],
+        "registry_sha256": sha256_path(delisting_path),
+        "reviewed_episode_count": 1,
+    }
+    (tmp_path / "delisting_registry_independent_review.json").write_text(
         json.dumps(
             {
-                **replay_core,
-                "verification_report_id": content_identity(replay_core),
+                **delisting_review_core,
+                "review_id": content_identity(delisting_review_core),
             }
         )
+    )
+    primitive_core = {
+        "schema_version": "lifecycle-primitive-evidence-manifest-v1",
+        "raw_root": str(raw_dir.resolve()),
+        "entries": [
+            {
+                "evidence_role": "first_observed_trade_zip",
+                "path": str(trade_path.resolve()),
+                "sha256": trade_hash,
+                "source_url": "https://official.example/trade.zip",
+                "source_identifier": trade["archive_object_key"],
+                "original_retrieval_timestamp": trade["original_retrieval_timestamp"],
+                "parser_schema_version": "test",
+            }
+        ],
+    }
+    (tmp_path / "primitive_evidence_manifest.json").write_text(
+        json.dumps({**primitive_core, "manifest_id": content_identity(primitive_core)})
     )
     config = tmp_path / "config" / "research_v0_1.yaml"
     config.write_text(
@@ -563,8 +685,20 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
         "lifecycle_adjudications.json",
         "lifecycle_daily_trade_boundaries.json",
         "primitive_evidence_manifest.json",
-        "full_evidence_verification_report.json",
+        "episode_first_observed_trades.json",
+        "historical_delisting_cutoff_registry.json",
+        "delisting_registry_independent_review.json",
+        "independent_eligibility_verification_report.json",
     ]
+    replay = run_eligibility_oracle(
+        tmp_path,
+        repository_root=tmp_path,
+        config_path=config,
+        executable_commit="a" * 40,
+    )
+    (tmp_path / "independent_eligibility_verification_report.json").write_text(
+        json.dumps(replay)
+    )
     bundle = build_bundle_payload(
         report_root=tmp_path,
         config_path=config,
@@ -677,3 +811,167 @@ def test_content_bound_bundle_and_plan_detect_mutation_and_forgery(tmp_path: Pat
     (tmp_path / "coverage.json").write_text("{}")
     with pytest.raises(ValueError, match="artifact hash mismatch"):
         verify_bound_plan(plan_path)
+
+
+def _two_episode_oracle_fixture() -> tuple[dict, list[dict]]:
+    expected = {
+        "episodes": [
+            {
+                "symbol": "AAAUSDT",
+                "scope_disposition": "in_scope_crypto_perpetual",
+                "lifecycle_episode_id": "AAAUSDT:1",
+                "age_live_anchor_at": "2023-01-01T00:00:00+00:00",
+                "anchor_basis": "first_observed_binance_futures_trade",
+                "eligible_from": "2023-01-31T00:00:00+00:00",
+                "delisting_announcement_published_at": "2023-03-01T00:00:00+00:00",
+                "delisting_article_id": "article-1",
+                "last_trading_at": "2023-03-02T00:00:00+00:00",
+                "conflict": None,
+            },
+            {
+                "symbol": "AAAUSDT",
+                "scope_disposition": "in_scope_crypto_perpetual",
+                "lifecycle_episode_id": "AAAUSDT:2",
+                "age_live_anchor_at": "2023-04-01T00:00:00+00:00",
+                "anchor_basis": "first_observed_binance_futures_trade",
+                "eligible_from": "2023-05-01T00:00:00+00:00",
+                "delisting_announcement_published_at": None,
+                "delisting_article_id": None,
+                "last_trading_at": None,
+                "conflict": None,
+            },
+        ]
+    }
+    intervals = [
+        {
+            **{key: value for key, value in item.items() if key not in {"scope_disposition", "conflict"}},
+            "interval_evidence_status": "reviewed_resolved",
+        }
+        for item in expected["episodes"]
+    ]
+    catalog = [
+        {
+            "symbol": "AAAUSDT",
+            "scope_disposition": "in_scope_crypto_perpetual",
+            "lifecycle_intervals": intervals,
+            "historical_inclusion_readiness": "ready",
+        }
+    ]
+    return expected, catalog
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "early_anchor",
+        "exact_listing_leak",
+        "missing_relist_age_reset",
+        "gap_continuity",
+        "wrong_delisting_article",
+        "wrong_delisting_time",
+        "wrong_delisting_symbol",
+        "wrong_delisting_episode",
+        "missing_cutoff",
+        "fabricated_cutoff",
+        "readiness",
+    ],
+)
+def test_independent_oracle_rejects_production_lifecycle_mutations(mutation: str) -> None:
+    expected, catalog = _two_episode_oracle_fixture()
+    intervals = catalog[0]["lifecycle_intervals"]
+    if mutation == "early_anchor":
+        intervals[0]["age_live_anchor_at"] = "2022-12-31T23:00:00+00:00"
+    elif mutation == "exact_listing_leak":
+        intervals[0]["age_live_anchor_at"] = "2022-12-20T00:00:00+00:00"
+        intervals[0]["anchor_basis"] = "exact_official_original_launch"
+    elif mutation == "missing_relist_age_reset":
+        intervals[1]["eligible_from"] = intervals[1]["age_live_anchor_at"]
+    elif mutation == "gap_continuity":
+        intervals[0]["last_trading_at"] = None
+    elif mutation == "wrong_delisting_article":
+        intervals[0]["delisting_article_id"] = "wrong-article"
+    elif mutation == "wrong_delisting_time":
+        intervals[0]["delisting_announcement_published_at"] = "2023-03-01T01:00:00Z"
+    elif mutation == "wrong_delisting_symbol":
+        intervals[0]["delisting_article_id"] = "article-for-BBBUSDT"
+    elif mutation == "wrong_delisting_episode":
+        intervals[1]["delisting_article_id"] = "article-1"
+    elif mutation == "missing_cutoff":
+        intervals[0]["delisting_announcement_published_at"] = None
+    elif mutation == "fabricated_cutoff":
+        intervals[1]["delisting_announcement_published_at"] = "2024-01-01T00:00:00Z"
+    else:
+        expected["episodes"][0]["conflict"] = "unresolved_delisting_evidence"
+    with pytest.raises(ValueError, match="Oracle"):
+        compare_production_catalog(expected, catalog)
+
+
+def _resign_report_and_bundle(bundle_path: Path, report: dict) -> None:
+    report_core = {key: value for key, value in report.items() if key != "verification_report_id"}
+    report["verification_report_id"] = content_identity(report_core)
+    report_path = bundle_path.parent / "independent_eligibility_verification_report.json"
+    report_path.write_text(json.dumps(report))
+    bundle = json.loads(bundle_path.read_text())
+    digest = sha256_path(report_path)
+    bundle["artifacts"]["independent_eligibility_verification_report.json"]["sha256"] = digest
+    bundle["authorization_chain"]["eligibility_oracle_report_id"] = report[
+        "verification_report_id"
+    ]
+    bundle["authorization_chain"]["eligibility_oracle_report_sha256"] = digest
+    core = {key: value for key, value in bundle.items() if key != "bundle_id"}
+    bundle["bundle_id"] = content_identity(core)
+    bundle_path.write_text(json.dumps(bundle))
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong"),
+    [
+        ("candidate_set_digest", "0" * 64),
+        ("candidate_count", 2),
+        ("reviewed_scope_registry_id", "0" * 64),
+        ("scope_independent_review_id", "0" * 64),
+        ("reviewed_delisting_registry_id", "0" * 64),
+        ("delisting_independent_review_id", "0" * 64),
+        ("lifecycle_adjudication_id", "0" * 64),
+        ("production_catalog_sha256", "0" * 64),
+        ("catalog_row_count", 2),
+        ("independently_derived_ready_count", 0),
+        ("executable_lifecycle_commit", "b" * 40),
+        ("primitive_manifest_id", "0" * 64),
+        ("episode_boundary_evidence_id", "0" * 64),
+    ],
+)
+def test_runtime_rejects_content_hashed_but_cross_bundle_wrong_report(
+    tmp_path: Path, field: str, wrong: object
+) -> None:
+    bundle_path, _ = _write_bundle(tmp_path)
+    report_path = tmp_path / "independent_eligibility_verification_report.json"
+    report = json.loads(report_path.read_text())
+    report[field] = wrong
+    _resign_report_and_bundle(bundle_path, report)
+    with pytest.raises(ValueError, match="authorization chain"):
+        verify_lifecycle_bundle(bundle_path)
+
+
+def test_runtime_rejects_placeholder_pass_report(tmp_path: Path) -> None:
+    bundle_path, _ = _write_bundle(tmp_path)
+    report = {
+        "schema_version": "independent-eligibility-oracle-report-v1",
+        "oracle_verification_status": "PASS",
+        "final_status": "PASS",
+    }
+    _resign_report_and_bundle(bundle_path, report)
+    with pytest.raises(ValueError, match="authorization chain"):
+        verify_lifecycle_bundle(bundle_path)
+
+
+def test_oracle_module_has_no_production_parser_or_builder_dependency() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "alt_hot_scanner"
+        / "universe"
+        / "eligibility_oracle.py"
+    ).read_text("utf-8")
+    assert "parse_announcement_evidence" not in source
+    assert "build_lifecycle_catalog" not in source

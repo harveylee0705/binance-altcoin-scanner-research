@@ -1,13 +1,15 @@
 # Historical USD-M Contract Lifecycle Catalog
 
-Schema version: `binance-usdm-lifecycle-v4`
+Schema version: `binance-usdm-lifecycle-v5`
 
 The catalog is research infrastructure, not a scanner result. Build it with:
 
 ```powershell
 .venv\Scripts\python scripts/build_lifecycle_catalog.py `
   --scope-registry config/reviewed_scope_registry_b323b3c3.json `
-  --adjudications config/lifecycle_adjudications_v1.json
+  --adjudications config/lifecycle_adjudications_v1.json `
+  --delisting-registry config/historical_delisting_cutoff_registry.json `
+  --delisting-review docs/reviews/delisting_registry_independent_review_2026-08-24.json
 ```
 
 This performs metadata-only acquisition. It does not download monthly OHLCV archives, compute
@@ -33,9 +35,10 @@ direct evidence, and the registry itself binds an independently hashed PASS arti
    observed data existence only.
 2. A current official `/fapi/v1/exchangeInfo` snapshot supplies current identity, product, subtype,
    onboard, delivery, and status metadata. It is never treated as historical universe membership.
-3. The earliest available official USD-M daily trade archive for each reviewed in-scope identity is
-   downloaded once, verified against its official SHA-256 sidecar, and parsed for the strict integer
-   minimum trade timestamp. This is `first_observed_trade_at`, never an exact launch timestamp.
+3. The earliest applicable official USD-M daily trade archive for every reviewed lifecycle episode
+   is downloaded once, verified against its official SHA-256 sidecar, and parsed for the strict
+   integer minimum trade timestamp. This controls `eligibility_age_anchor_at`; exact listing and
+   relisting timestamps remain separately stored descriptive metadata.
 4. Binance's public structured CMS list/detail responses supply listing/delisting articles. Catalog
    pages and article details are stored as immutable raw JSON. Article publication time remains
    separate from stated trading-start or last-trading time.
@@ -71,10 +74,9 @@ as `UP`/`DOWN` are discovery flags only and never classification evidence.
 
 ## Eligibility contract
 
-Eligibility requires resolved instrument scope, a resolved eligibility-age anchor, 30 elapsed
-calendar days, valid market data, and a signal strictly before an exact known delisting-announcement
-publication time. Exact official original launch is preferred. Otherwise a checksum-verified first
-Binance Futures trade is a conservative live boundary and is never relabeled exact. A completed
+Eligibility requires resolved instrument scope, a checksum-verified first-trade eligibility anchor,
+30 elapsed calendar days, valid market data, and a signal strictly before an exact reviewed
+delisting-announcement publication time. Listing announcements never control age eligibility. A completed
 official delisting search with no reliable publication timestamp leaves the cutoff null and does not
 remove historical data. Incomplete/conflicting evidence fails closed. Current status never
 back-filters history.
@@ -82,11 +84,16 @@ back-filters history.
 When evidence establishes `live → terminated → relisted`, `lifecycle_intervals` contains ordered,
 non-overlapping episodes. Eligibility selects the interval active at the signal timestamp, blocks
 timestamps before the first episode, after termination, and inside gaps, and resets the fixed
-30-calendar-day age clock from each relisting boundary. A current/old-evidence disagreement alone is
-not enough to create an episode.
+30-calendar-day age clock from the first verified post-gap trade of each relisted episode. A
+current/old-evidence disagreement alone is not enough to create an episode.
+
+The immutable reviewed delisting registry is the sole authority for lifecycle-critical publication
+cutoffs. The approval-time eligibility oracle independently reconstructs episode eligibility from
+primitive trade evidence and reviewed registries. Its module does not import or call the production
+announcement parser or lifecycle builder; only after derivation does it compare against the catalog.
 
 Each run writes its catalog, evidence tables, candidate inventory, reviewed-registry copy,
-adjudications, daily boundary evidence, primitive manifest, full replay report, recomputed readiness
+adjudications, daily boundary evidence, primitive manifest, independent oracle report, recomputed readiness
 report, lifecycle bundle,
 coverage report, acquisition manifest, and unresolved queue under ignored
 `reports/lifecycle/<RUN_ID>`. The bundle SHA-256-binds the exact catalog, classification,

@@ -900,6 +900,57 @@ def acquire_first_observed_trade(
     )
 
 
+def acquire_episode_first_observed_trade(
+    symbol: str,
+    archive_object_key: str,
+    raw_root: str | Path,
+    *,
+    episode_id: str,
+) -> dict[str, Any]:
+    """Acquire one reviewed post-gap daily trade archive and derive its first trade."""
+    identity = validate_daily_trade_object_key(archive_object_key)
+    if identity.symbol != require_archive_symbol_identity(symbol, "episode trade symbol"):
+        raise ValueError("Episode trade archive has the wrong symbol")
+    if episode_id != f"{symbol}:{episode_id.rsplit(':', 1)[-1]}":
+        raise ValueError("Episode identifier is not bound to the archive symbol")
+    encoded_key = urllib.parse.quote(identity.object_key, safe="/")
+    url = f"{ARCHIVE_HOST}/{encoded_key}"
+    checksum_payload = _read_url(f"{url}.CHECKSUM")
+    published = parse_checksum_sidecar(checksum_payload, identity)  # type: ignore[arg-type]
+    destination = (
+        Path(raw_root).resolve(strict=False)
+        / "episode_first_observed_trades"
+        / safe_identity_component(identity.symbol)
+        / f"episode_{episode_id.rsplit(':', 1)[-1]}_{identity.period}.zip"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        computed, _ = sha256_file(destination)
+        if computed != published:
+            raise ValueError("Existing episode trade evidence differs from published checksum")
+        retrieved_at = datetime.fromtimestamp(destination.stat().st_mtime, UTC).isoformat()
+    else:
+        payload = _read_url(url)
+        computed = hashlib.sha256(payload).hexdigest()
+        if computed != published:
+            raise ValueError("Episode trade archive differs from published checksum")
+        _write_bytes_exclusive_atomic(destination, payload)
+        retrieved_at = datetime.now(UTC).isoformat()
+    return {
+        "symbol": identity.symbol,
+        "lifecycle_episode_id": episode_id,
+        "archive_object_key": identity.object_key,
+        "archive_date": identity.period,
+        "published_sha256": published,
+        "computed_sha256": computed,
+        "raw_path": str(destination.resolve()),
+        "original_retrieval_timestamp": retrieved_at,
+        "earliest_trade_timestamp": parse_earliest_trade_timestamp(destination).isoformat(),
+        "parser_version": "binance-usdm-daily-trade-episode-first-observation-v1",
+        "evidence_status": "checksum_verified_official_binance_futures_trade",
+    }
+
+
 def verify_first_observed_trade_record(row: dict[str, Any]) -> None:
     """Re-hash and reparse one persisted first-trade primitive for safe process parallelism."""
     required = {

@@ -96,6 +96,8 @@ def build_primitive_evidence_manifest(
                 role = "cms_article_detail_response"
             elif relative.startswith("trade_probe/first_observed_trades/"):
                 role = "first_observed_trade_zip"
+            elif relative.startswith("trade_probe/episode_first_observed_trades/"):
+                role = "episode_first_observed_trade_zip"
             elif relative.startswith("daily_trade_boundary_index/"):
                 role = "daily_trade_boundary_index_xml"
             else:

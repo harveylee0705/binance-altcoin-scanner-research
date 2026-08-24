@@ -10,8 +10,8 @@ import pandas as pd
 
 from alt_hot_scanner.identity import require_archive_symbol_identity
 
-CATALOG_SCHEMA_VERSION = "binance-usdm-lifecycle-v4"
-PARSER_VERSION = "lifecycle-catalog-v4"
+CATALOG_SCHEMA_VERSION = "binance-usdm-lifecycle-v5"
+PARSER_VERSION = "lifecycle-catalog-v5"
 
 CATALOG_COLUMNS = [
     "catalog_schema_version",
@@ -185,6 +185,8 @@ def _adjudicated_intervals(
     evidence: pd.DataFrame,
     adjudication: dict[str, Any],
     adjudication_id: str,
+    episode_trade_by_id: dict[str, dict[str, Any]],
+    cutoff_by_id: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     symbol = record["symbol"]
     intervals: list[dict[str, Any]] = []
@@ -192,47 +194,36 @@ def _adjudicated_intervals(
     for rejected_item in rejected:
         _article_event(evidence, symbol, "listing", rejected_item["article_id"])
     for spec in adjudication["episodes"]:
-        basis = spec["anchor_basis"]
+        basis = "first_observed_binance_futures_trade"
         listing = None
         if spec.get("listing_article_id") is not None:
             listing = _article_event(evidence, symbol, "listing", spec["listing_article_id"])
-        if basis in {"exact_official_original_launch", "exact_official_relisting_launch"}:
-            anchor = None if listing is None else _iso(listing["official_event_at"])
-        elif basis in {
-            "first_observed_binance_futures_trade",
-            "legacy_pre_research_start_adjudicated",
-        }:
-            anchor = _iso(record.get("first_observed_trade_at"))
-        else:
-            raise ValueError(f"Unsupported adjudicated age-anchor basis for {symbol}")
+        trade = episode_trade_by_id.get(spec["episode_id"])
+        anchor = None if trade is None else _iso(trade.get("earliest_trade_timestamp"))
         if anchor is None:
             raise ValueError(f"Adjudicated lifecycle episode lacks a live anchor for {symbol}")
-
-        delisting = None
-        if spec.get("delisting_article_id") is not None:
-            delisting = _article_event(
-                evidence, symbol, "delisting", spec["delisting_article_id"]
-            )
-        cutoff = None if delisting is None else _iso(delisting["article_published_at"])
+        reviewed_cutoff = cutoff_by_id.get(spec["episode_id"])
+        if reviewed_cutoff is None:
+            raise ValueError("Adjudicated lifecycle episode lacks reviewed delisting disposition")
+        cutoff = _iso(reviewed_cutoff.get("official_publication_timestamp"))
         terminated = _iso(spec.get("terminated_at"))
-        if terminated is None and delisting is not None:
-            terminated = _iso(delisting["official_event_at"])
+        if terminated is None:
+            terminated = _iso(reviewed_cutoff.get("terminal_last_trading_at"))
         interval = {
             "symbol": symbol,
             "lifecycle_episode_id": spec["episode_id"],
             "age_live_anchor_at": anchor,
             "anchor_basis": basis,
+            "eligible_from": (pd.Timestamp(anchor) + pd.Timedelta(days=30)).isoformat(),
             "listing_article_id": None if listing is None else listing["article_code"],
             "listing_source_url": None if listing is None else listing["source_url"],
             "listing_raw_snapshot_sha256": (
                 None if listing is None else listing["raw_snapshot_sha256"]
             ),
             "delisting_announcement_published_at": cutoff,
-            "delisting_article_id": None if delisting is None else delisting["article_code"],
-            "delisting_source_url": None if delisting is None else delisting["source_url"],
-            "delisting_raw_snapshot_sha256": (
-                None if delisting is None else delisting["raw_snapshot_sha256"]
-            ),
+            "delisting_article_id": reviewed_cutoff.get("article_code"),
+            "delisting_source_url": reviewed_cutoff.get("official_article_url"),
+            "delisting_raw_snapshot_sha256": reviewed_cutoff.get("raw_article_sha256"),
             "last_trading_at": terminated,
             "termination_basis": spec.get("termination_basis"),
             "eligibility_end_at": cutoff or terminated,
@@ -261,6 +252,8 @@ def build_lifecycle_catalog(
     created_at: pd.Timestamp | None = None,
     announcement_search_completed: bool | None = None,
     first_observed_trades: pd.DataFrame | None = None,
+    episode_first_observed_trades: list[dict[str, Any]] | None = None,
+    delisting_registry_records: list[dict[str, Any]] | None = None,
     scope_registry_records: list[dict[str, Any]] | None = None,
     lifecycle_adjudications: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
@@ -297,6 +290,16 @@ def build_lifecycle_catalog(
     if not trades.empty and trades["symbol"].duplicated().any():
         raise ValueError("First-observed-trade evidence must have one row per symbol")
     trades_by_symbol = trades.set_index("symbol", drop=False) if not trades.empty else pd.DataFrame()
+    episode_trade_by_id = {
+        row["lifecycle_episode_id"]: row for row in (episode_first_observed_trades or [])
+    }
+    if len(episode_trade_by_id) != len(episode_first_observed_trades or []):
+        raise ValueError("Episode first-trade evidence contains duplicate episodes")
+    cutoff_by_id = {
+        row["lifecycle_episode_id"]: row for row in (delisting_registry_records or [])
+    }
+    if len(cutoff_by_id) != len(delisting_registry_records or []):
+        raise ValueError("Delisting registry contains duplicate episodes")
     scope_by_symbol = {
         row.get("contract_identity"): row for row in (scope_registry_records or [])
     }
@@ -429,25 +432,6 @@ def build_lifecycle_catalog(
                     "first_observed_trade_evidence_status": trade["evidence_status"],
                 }
             )
-        delisting = _accepted_event(evidence, symbol, "delisting")
-        if delisting is not None:
-            record.update(
-                {
-                    "delisting_announcement_published_at": delisting[
-                        "article_published_at"
-                    ],
-                    "official_last_trading_at": delisting["official_event_at"],
-                    "delisting_evidence_status": delisting["event_time_evidence_status"],
-                    "delisting_source_type": "official_binance_structured_announcement",
-                    "delisting_source_url": delisting["source_url"],
-                    "delisting_article_id": delisting["article_code"],
-                    "delisting_retrieved_at": delisting["retrieved_at"],
-                    "delisting_raw_snapshot_path": delisting["raw_snapshot_path"],
-                    "delisting_raw_snapshot_sha256": delisting["raw_snapshot_sha256"],
-                    "delisting_parser_version": delisting["parser_version"],
-                }
-            )
-
         scope_is_excluded = str(record["scope_disposition"]).startswith("excluded")
         classification_complete = record["scope_classification_status"] != "unresolved" and (
             scope_is_excluded
@@ -467,23 +451,9 @@ def build_lifecycle_catalog(
             observed_start
         ) < pd.Timestamp(exact_start):
             anchor_conflict = "first_observed_trade_precedes_claimed_exact_launch"
-        elif exact_start is not None:
-            anchor = exact_start
-            anchor_basis = "exact_official_original_launch"
-        elif observed_start is not None:
-            observed_timestamp = pd.Timestamp(observed_start)
-            if observed_timestamp <= pd.Timestamp("2019-12-02T00:00:00Z"):
-                anchor = observed_start
-                anchor_basis = "legacy_pre_research_start_adjudicated"
-            elif observed_timestamp < pd.Timestamp("2020-01-01T00:00:00Z"):
-                # The verified trade explicitly adjudicates that the contract was not yet
-                # 30 days old at research start; it becomes eligible 30 days after this
-                # conservative boundary rather than being guessed older.
-                anchor = observed_start
-                anchor_basis = "first_observed_binance_futures_trade"
-            else:
-                anchor = observed_start
-                anchor_basis = "first_observed_binance_futures_trade"
+        if observed_start is not None:
+            anchor = observed_start
+            anchor_basis = "first_observed_binance_futures_trade"
         is_current = record["present_in_current_exchange_info"] is True
         status = record["latest_known_status"]
         is_trading = is_current and status == "TRADING"
@@ -506,7 +476,12 @@ def build_lifecycle_catalog(
         }
         if adjudication is not None:
             intervals = _adjudicated_intervals(
-                record, evidence, adjudication, str(adjudication_id)
+                record,
+                evidence,
+                adjudication,
+                str(adjudication_id),
+                episode_trade_by_id,
+                cutoff_by_id,
             )
             first_interval = intervals[0]
             last_interval = intervals[-1]
@@ -558,9 +533,6 @@ def build_lifecycle_catalog(
                     }
                 )
             if last_interval["delisting_article_id"] is not None:
-                final_delisting = _article_event(
-                    evidence, symbol, "delisting", last_interval["delisting_article_id"]
-                )
                 record.update(
                     {
                         "delisting_announcement_published_at": last_interval[
@@ -569,14 +541,12 @@ def build_lifecycle_catalog(
                         "official_last_trading_at": last_interval["last_trading_at"],
                         "delisting_evidence_status": "reviewed_exact_episode_termination",
                         "delisting_source_type": "official_binance_structured_announcement",
-                        "delisting_source_url": final_delisting["source_url"],
-                        "delisting_article_id": final_delisting["article_code"],
-                        "delisting_retrieved_at": final_delisting["retrieved_at"],
-                        "delisting_raw_snapshot_path": final_delisting["raw_snapshot_path"],
-                        "delisting_raw_snapshot_sha256": final_delisting[
-                            "raw_snapshot_sha256"
+                        "delisting_source_url": last_interval["delisting_source_url"],
+                        "delisting_article_id": last_interval["delisting_article_id"],
+                        "delisting_raw_snapshot_sha256": last_interval[
+                            "delisting_raw_snapshot_sha256"
                         ],
-                        "delisting_parser_version": final_delisting["parser_version"],
+                        "delisting_parser_version": "reviewed-delisting-registry-v1",
                     }
                 )
             else:
@@ -599,7 +569,35 @@ def build_lifecycle_catalog(
             )
             delisting_ready = True
         else:
-            listing_complete = anchor is not None and anchor_conflict == "none"
+            reviewed_cutoff = cutoff_by_id.get(f"{symbol}:1")
+            if in_research_scope and reviewed_cutoff is None:
+                has_delisting_conflict = True
+            elif reviewed_cutoff is not None:
+                record.update(
+                    {
+                        "delisting_announcement_published_at": reviewed_cutoff.get(
+                            "official_publication_timestamp"
+                        ),
+                        "official_last_trading_at": reviewed_cutoff.get(
+                            "terminal_last_trading_at"
+                        ),
+                        "delisting_evidence_status": reviewed_cutoff.get("review_status"),
+                        "delisting_source_type": "reviewed_delisting_cutoff_registry",
+                        "delisting_source_url": reviewed_cutoff.get("official_article_url"),
+                        "delisting_article_id": reviewed_cutoff.get("article_code"),
+                        "delisting_raw_snapshot_sha256": reviewed_cutoff.get(
+                            "raw_article_sha256"
+                        ),
+                        "delisting_parser_version": "reviewed-delisting-registry-v1",
+                    }
+                )
+                has_delisting_conflict = reviewed_cutoff.get("review_status") == (
+                    "unresolved_conflicting_evidence"
+                )
+            exact_delisting = record["delisting_announcement_published_at"] is not None
+            # Exact listing metadata is descriptive only. A verified trade anchor is
+            # sufficient even when the announcement's scheduled time is contradicted.
+            listing_complete = anchor is not None
             if has_delisting_conflict:
                 delisting_state = "conflicting_evidence"
             elif exact_delisting:
@@ -624,6 +622,9 @@ def build_lifecycle_catalog(
                         "lifecycle_episode_id": f"{symbol}:1",
                         "age_live_anchor_at": _iso(anchor),
                         "anchor_basis": anchor_basis,
+                        "eligible_from": (
+                            pd.Timestamp(anchor) + pd.Timedelta(days=30)
+                        ).isoformat(),
                         "listing_article_id": record.get("listing_article_id"),
                         "listing_source_url": record.get("listing_source_url"),
                         "listing_raw_snapshot_sha256": record.get(
@@ -648,7 +649,9 @@ def build_lifecycle_catalog(
                         )
                         or _iso(record.get("official_last_trading_at")),
                         "interval_evidence_status": (
-                            "resolved" if listing_complete and delisting_ready else "blocked"
+                            "reviewed_resolved"
+                            if listing_complete and delisting_ready
+                            else "blocked"
                         ),
                         "conflicts": [],
                     }

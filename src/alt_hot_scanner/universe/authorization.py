@@ -10,11 +10,12 @@ import pandas as pd
 
 from alt_hot_scanner.data.binance_public import validate_archive_object_key
 from alt_hot_scanner.universe.contracts import filter_instrument_scope
+from alt_hot_scanner.universe.eligibility_oracle import run_eligibility_oracle
 from alt_hot_scanner.universe.lifecycle import CATALOG_SCHEMA_VERSION
 from alt_hot_scanner.universe.scope_registry import verify_scope_registry
 from alt_hot_scanner.utils.config import load_config
 
-BUNDLE_SCHEMA_VERSION = "lifecycle-authorization-bundle-v3"
+BUNDLE_SCHEMA_VERSION = "lifecycle-authorization-bundle-v4"
 APPROVAL_SCHEMA_VERSION = "lifecycle-approval-pin-v2"
 APPROVAL_STATE_SCHEMA_VERSION = "lifecycle-approval-state-registry-v1"
 PLAN_SCHEMA_VERSION = "full-history-download-plan-v4"
@@ -67,7 +68,6 @@ def catalog_readiness(catalog: pd.DataFrame, noncanonical_candidates: list[str])
         & catalog["scope_classification_complete"].eq(True)
         & catalog["eligibility_age_anchor_at"].notna()
         & catalog["eligibility_age_anchor_basis"].ne("unresolved")
-        & catalog["age_anchor_conflict_status"].eq("none")
         & catalog["delisting_evidence_state"].isin(
             [
                 "not_applicable_currently_trading",
@@ -119,7 +119,16 @@ def build_bundle_payload(
         (report_root / "primitive_evidence_manifest.json").read_text("utf-8")
     )
     replay = json.loads(
-        (report_root / "full_evidence_verification_report.json").read_text("utf-8")
+        (report_root / "independent_eligibility_verification_report.json").read_text("utf-8")
+    )
+    delisting = json.loads(
+        (report_root / "historical_delisting_cutoff_registry.json").read_text("utf-8")
+    )
+    delisting_review = json.loads(
+        (report_root / "delisting_registry_independent_review.json").read_text("utf-8")
+    )
+    episodes = json.loads(
+        (report_root / "episode_first_observed_trades.json").read_text("utf-8")
     )
     adjudications = json.loads(
         (report_root / "lifecycle_adjudications.json").read_text("utf-8")
@@ -140,9 +149,9 @@ def build_bundle_payload(
             "primitive_evidence_manifest_sha256": artifacts[
                 "primitive_evidence_manifest.json"
             ]["sha256"],
-            "full_evidence_verification_report_id": replay["verification_report_id"],
-            "full_evidence_verification_report_sha256": artifacts[
-                "full_evidence_verification_report.json"
+            "eligibility_oracle_report_id": replay["verification_report_id"],
+            "eligibility_oracle_report_sha256": artifacts[
+                "independent_eligibility_verification_report.json"
             ]["sha256"],
             "reviewed_scope_registry_id": scope["registry_id"],
             "reviewed_scope_registry_sha256": artifacts[
@@ -150,6 +159,18 @@ def build_bundle_payload(
             ]["sha256"],
             "scope_independent_review": scope["independent_review"],
             "lifecycle_adjudication_id": adjudications["adjudication_id"],
+            "reviewed_delisting_registry_id": delisting["registry_id"],
+            "reviewed_delisting_registry_sha256": artifacts[
+                "historical_delisting_cutoff_registry.json"
+            ]["sha256"],
+            "delisting_independent_review_id": delisting_review["review_id"],
+            "delisting_independent_review_sha256": artifacts[
+                "delisting_registry_independent_review.json"
+            ]["sha256"],
+            "episode_boundary_evidence_id": episodes["evidence_id"],
+            "episode_boundary_evidence_sha256": artifacts[
+                "episode_first_observed_trades.json"
+            ]["sha256"],
         },
     }
     return {**core, "bundle_id": content_identity(core)}
@@ -418,7 +439,10 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         "lifecycle_adjudications.json",
         "lifecycle_daily_trade_boundaries.json",
         "primitive_evidence_manifest.json",
-        "full_evidence_verification_report.json",
+        "episode_first_observed_trades.json",
+        "historical_delisting_cutoff_registry.json",
+        "delisting_registry_independent_review.json",
+        "independent_eligibility_verification_report.json",
     }
     artifacts = bundle.get("artifacts")
     if type(artifacts) is not dict or set(artifacts) != required:
@@ -478,7 +502,16 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         resolved["primitive_evidence_manifest.json"].read_text("utf-8")
     )
     replay = json.loads(
-        resolved["full_evidence_verification_report.json"].read_text("utf-8")
+        resolved["independent_eligibility_verification_report.json"].read_text("utf-8")
+    )
+    delisting = json.loads(
+        resolved["historical_delisting_cutoff_registry.json"].read_text("utf-8")
+    )
+    delisting_review = json.loads(
+        resolved["delisting_registry_independent_review.json"].read_text("utf-8")
+    )
+    episodes = json.loads(
+        resolved["episode_first_observed_trades.json"].read_text("utf-8")
     )
     adjudications = json.loads(resolved["lifecycle_adjudications.json"].read_text("utf-8"))
     primitive_core = {key: value for key, value in primitive.items() if key != "manifest_id"}
@@ -494,9 +527,9 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         "primitive_evidence_manifest_sha256": artifacts[
             "primitive_evidence_manifest.json"
         ]["sha256"],
-        "full_evidence_verification_report_id": replay.get("verification_report_id"),
-        "full_evidence_verification_report_sha256": artifacts[
-            "full_evidence_verification_report.json"
+        "eligibility_oracle_report_id": replay.get("verification_report_id"),
+        "eligibility_oracle_report_sha256": artifacts[
+            "independent_eligibility_verification_report.json"
         ]["sha256"],
         "reviewed_scope_registry_id": scope_registry.get("registry_id"),
         "reviewed_scope_registry_sha256": artifacts[
@@ -504,11 +537,31 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         ]["sha256"],
         "scope_independent_review": scope_registry.get("independent_review"),
         "lifecycle_adjudication_id": adjudications.get("adjudication_id"),
+        "reviewed_delisting_registry_id": delisting.get("registry_id"),
+        "reviewed_delisting_registry_sha256": artifacts[
+            "historical_delisting_cutoff_registry.json"
+        ]["sha256"],
+        "delisting_independent_review_id": delisting_review.get("review_id"),
+        "delisting_independent_review_sha256": artifacts[
+            "delisting_registry_independent_review.json"
+        ]["sha256"],
+        "episode_boundary_evidence_id": episodes.get("evidence_id"),
+        "episode_boundary_evidence_sha256": artifacts[
+            "episode_first_observed_trades.json"
+        ]["sha256"],
     }
+    expected_replay = run_eligibility_oracle(
+        path.parent,
+        repository_root=config_path.parent.parent,
+        config_path=config_path,
+        executable_commit=bundle.get("code_commit"),
+    )
     if (
         primitive.get("manifest_id") != content_identity(primitive_core)
         or replay.get("verification_report_id") != content_identity(replay_core)
-        or replay.get("status") != "PASS"
+        or replay != expected_replay
+        or replay.get("oracle_verification_status") != "PASS"
+        or replay.get("final_status") != "PASS"
         or adjudications.get("adjudication_id") != content_identity(adjudication_core)
         or inventory.get("candidate_set_digest") != scope_registry.get("candidate_set_digest")
         or chain != expected_chain

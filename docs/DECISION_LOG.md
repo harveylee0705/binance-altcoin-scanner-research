@@ -1,5 +1,20 @@
 # Decision Log
 
+## 2026-08-24 — Final pre-evaluation conservative lifecycle policy
+
+Decision: the earliest checksum-verified observed Binance USD-M Futures trade in each lifecycle
+episode is the authoritative Scanner v0.1 live/age anchor. The 30-calendar-day age clock begins at
+that timestamp and resets after every genuine relisting. Exact official listing/relisting times are
+preserved as descriptive metadata but can never make a contract eligible. Delisting publication
+cutoffs are authorized only by the versioned, independently reviewed historical delisting registry;
+the production CMS parser may propose evidence but cannot authorize a cutoff.
+
+Reason: an actual Futures trade cannot precede the existence of the tradable Futures contract. The
+small difference from a scheduled launch time has negligible research cost after the fixed 30-day
+minimum age, while making the no-prelisting boundary conservative and independently verifiable.
+This lifecycle-evidence clarification was frozen before scanner outcomes, validation, or holdout
+inspection and does not modify HotScore or any scanner/evaluation semantics.
+
 ## 2026-08-23 — Pre-evaluation lifecycle age-anchor evidence policy
 
 Decision: a contract must never become eligible before it existed and traded on Binance Futures,

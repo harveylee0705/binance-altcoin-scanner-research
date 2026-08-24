@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 import scripts.download_from_plan as downloader
-from alt_hot_scanner.data.announcements import classify_article_semantics
+from alt_hot_scanner.data.announcements import (
+    _symbols_in_order,
+    classify_article_semantics,
+)
 from alt_hot_scanner.universe.adjudications import load_lifecycle_adjudications
 from alt_hot_scanner.universe.authorization import (
     APPROVAL_SCHEMA_VERSION,
@@ -196,6 +199,14 @@ def test_futures_product_semantics_reject_coin_margined_and_spot_delistings() ->
     assert classify_article_semantics(
         "Binance Futures Will Delist CRV Coin-Margined Perpetual Contract", ""
     ) == "irrelevant"
+
+
+def test_shared_usdt_margined_title_recovers_every_exact_contract() -> None:
+    title = "Binance Futures Will Delist TLM and ICP USDT-Margined Contracts"
+    assert _symbols_in_order(title, {"TLMUSDT", "ICPUSDT"}) == [
+        "TLMUSDT",
+        "ICPUSDT",
+    ]
     assert classify_article_semantics(
         "Binance Will Delist ABCUSDT on Spot",
         "ABCUSDT Perpetual Contract remains available on Binance Futures.",
@@ -228,12 +239,14 @@ def test_reviewed_conflict_adjudications_preserve_required_dispositions() -> Non
     } == {
         "AERGOUSDT",
         "AIAUSDT",
+        "BNXUSDT",
         "CTKUSDT",
         "CVCUSDT",
         "CVXUSDT",
         "ICPUSDT",
         "MAVIAUSDT",
         "SLPUSDT",
+        "TLMUSDT",
     }
     assert adjudications["OMGUSDT"]["episodes"][-1]["termination_basis"]
     assert adjudications["XEMUSDT"]["episodes"][-1]["termination_basis"]

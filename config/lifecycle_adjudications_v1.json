@@ -1,5 +1,5 @@
 {
-  "adjudication_id": "6695915ebb7df0f1baaa78dafa1a5fec64a63757aa19e512ba94c869c05280eb",
+  "adjudication_id": "d6ce1c7575cdd243eb16690da84afb5dc2829f5a373f92de0e797f561073a831",
   "candidate_set_digest": "b323b3c3ba1010654d9ce1a47325364f7c7e624624857554b7e945f38f91c445",
   "records": [
     {
@@ -53,6 +53,30 @@
       ],
       "symbol": "AIAUSDT",
       "summary": "The December termination and January 20 relisting are genuine; the superseded January 16 launch claim is not used as a live boundary."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "first_observed_binance_futures_trade",
+          "episode_id": "BNXUSDT:1",
+          "terminated_at": "2023-02-11T04:00:00+00:00",
+          "termination_basis": "official_relaunch_notice_prior_settlement"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "episode_id": "BNXUSDT:2",
+          "listing_article_id": "940d0e48493e4627889c3f46371df70b",
+          "terminated_at": "2025-03-17T09:00:00+00:00",
+          "termination_basis": "exchange_info_delivery_and_complete_daily_trade_index"
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2023-02-22",
+        "last_pre_gap_trade_archive_date": "2023-02-11",
+        "last_terminal_trade_archive_date": "2025-03-17"
+      },
+      "symbol": "BNXUSDT",
+      "summary": "The official relaunch notice records settlement of the old contract, the complete daily index establishes the relisting gap, and the current exchangeInfo delivery timestamp plus terminal daily archive close the second episode; no reliable final-delisting publication was found."
     },
     {
       "episodes": [
@@ -230,6 +254,29 @@
       },
       "symbol": "SLPUSDT",
       "summary": "Official Futures termination, daily archive gap, and later launch establish a genuine relisting."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "first_observed_binance_futures_trade",
+          "delisting_article_id": "af469aeeab074738bb4a276070a9d11b",
+          "episode_id": "TLMUSDT:1",
+          "terminated_at": "2022-06-09T09:00:00+00:00",
+          "termination_basis": "official_delisting_event"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "episode_id": "TLMUSDT:2",
+          "listing_article_id": "bd18df283ead40d09fd60c8eab984e41",
+          "termination_basis": null
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2023-03-30",
+        "last_pre_gap_trade_archive_date": "2022-06-09"
+      },
+      "symbol": "TLMUSDT",
+      "summary": "The official USD-M settlement article, complete daily-trade gap, and later official launch establish a genuine relisting."
     },
     {
       "episodes": [

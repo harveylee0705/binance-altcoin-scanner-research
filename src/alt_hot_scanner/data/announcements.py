@@ -38,6 +38,10 @@ _USDT_MARGINED_SYMBOL = re.compile(
     r"(?<![A-Z0-9])([A-Z0-9]{1,60})\s+USDT-Margined\s+Contracts?\b",
     re.IGNORECASE,
 )
+_SHARED_USDT_MARGINED_SYMBOLS = re.compile(
+    r"(?<![A-Z0-9])(?P<bases>[A-Z0-9]{1,20}"
+    r"(?:\s*(?:,|and)\s*[A-Z0-9]{1,20})+)\s+USDT-Margined\s+Contracts?\b"
+)
 _DATE_FIRST = re.compile(
     r"(?P<date>20\d{2}[-/]\d{2}[-/]\d{2})\s+(?:at\s+)?"
     r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s*(?P<ampm>AM|PM)?\s*\(UTC\)",
@@ -125,6 +129,11 @@ def _symbols_in_order(text: str, archive_symbols: set[str]) -> list[str]:
         matches.append((match.start(), f"{match.group(1)}USDT"))
     for match in _USDT_MARGINED_SYMBOL.finditer(text):
         matches.append((match.start(), f"{match.group(1).upper()}USDT"))
+    for match in _SHARED_USDT_MARGINED_SYMBOLS.finditer(text):
+        for base_match in re.finditer(r"[A-Z0-9]{1,20}", match.group("bases")):
+            matches.append(
+                (match.start() + base_match.start(), f"{base_match.group(0)}USDT")
+            )
     ordered: list[str] = []
     for _, symbol in sorted(matches):
         if symbol in archive_symbols and symbol not in ordered:

@@ -90,6 +90,7 @@ def _listing(at: str) -> pd.DataFrame:
                 "raw_snapshot_path": "/launch.json",
                 "raw_snapshot_sha256": "a" * 64,
                 "parser_version": "test",
+                "article_semantic_class": "original_perpetual_launch",
             }
         ]
     )
@@ -185,6 +186,56 @@ def test_observed_trade_anchor_age_rule_conflict_and_legacy_policy() -> None:
         "first_observed_binance_futures_trade"
     )
     assert legacy.iloc[0]["age_anchor_conflict_status"] == "none"
+
+
+def test_adjudication_preserves_descriptive_launch_separate_from_trade_anchor() -> None:
+    trade = _trade("2021-01-01T00:00:01+00:00")
+    cutoff = {
+        "symbol": "ABCUSDT",
+        "lifecycle_episode_id": "ABCUSDT:1",
+        "official_publication_timestamp": None,
+        "terminal_last_trading_at": None,
+        "article_code": None,
+        "official_article_url": None,
+        "raw_article_sha256": None,
+        "review_status": "not_applicable_current_episode",
+    }
+    adjudication = {
+        "adjudication_id": "reviewed-adjudication",
+        "by_symbol": {
+            "ABCUSDT": {
+                "symbol": "ABCUSDT",
+                "episodes": [
+                    {
+                        "episode_id": "ABCUSDT:1",
+                        "anchor_basis": "exact_official_original_launch",
+                        "listing_article_id": "launch",
+                        "termination_basis": None,
+                    }
+                ],
+            }
+        },
+    }
+    catalog = build_lifecycle_catalog(
+        _archive(),
+        pd.DataFrame(),
+        _listing("2021-01-01T00:00:00+00:00"),
+        first_observed_trades=trade,
+        episode_first_observed_trades=[
+            {**trade.iloc[0].to_dict(), "lifecycle_episode_id": "ABCUSDT:1"}
+        ],
+        delisting_registry_records=[cutoff],
+        scope_registry_records=_scope(),
+        lifecycle_adjudications=adjudication,
+        announcement_search_completed=True,
+    )
+    row = catalog.iloc[0]
+    assert row["exact_official_trading_start_at"] == "2021-01-01T00:00:00+00:00"
+    assert row["official_trading_start_at"] == "2021-01-01T00:00:00+00:00"
+    assert row["eligibility_age_anchor_at"] == "2021-01-01T00:00:01+00:00"
+    assert row["lifecycle_intervals"][0]["age_live_anchor_at"] == (
+        "2021-01-01T00:00:01+00:00"
+    )
 
 
 def _trade_zip(rows: list[str]) -> bytes:

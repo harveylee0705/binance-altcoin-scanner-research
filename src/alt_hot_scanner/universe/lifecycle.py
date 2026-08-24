@@ -496,10 +496,10 @@ def build_lifecycle_catalog(
                         "listing_announcement_published_at": first_listing[
                             "article_published_at"
                         ],
-                        "exact_official_trading_start_at": first_interval[
-                            "age_live_anchor_at"
+                        "exact_official_trading_start_at": first_listing[
+                            "official_event_at"
                         ],
-                        "official_trading_start_at": first_interval["age_live_anchor_at"],
+                        "official_trading_start_at": first_listing["official_event_at"],
                         "listing_evidence_status": "reviewed_exact_episode_launch",
                         "listing_source_type": "official_binance_structured_announcement",
                         "listing_source_url": first_listing["source_url"],

@@ -313,6 +313,16 @@ def _action_anchored_event_times(
             symbol = match.group("symbol").upper()
             if symbol in mapped and symbol in archive_symbols:
                 mapped[symbol] = _parse_timestamp(match)
+        legacy_table = re.compile(
+            r"(?P<symbol>[A-Z0-9]{2,60}(?:USDT|USDC|BUSD))\s+Launch\s+Time\s*:?[ ]*"
+            r"(?P<date>20\d{2}[-/]\d{2}[-/]\d{2})\s+"
+            r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s*(?P<ampm>AM|PM)?\s*\(UTC\)",
+            re.IGNORECASE,
+        )
+        for match in legacy_table.finditer(re.sub(r"\s+", " ", bounded)):
+            symbol = match.group("symbol").upper()
+            if symbol in mapped and symbol in archive_symbols:
+                mapped[symbol] = _parse_timestamp(match)
     return mapped
 
 

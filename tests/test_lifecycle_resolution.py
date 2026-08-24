@@ -296,6 +296,19 @@ def test_announcement_context_terminates_across_mixed_purpose_rows() -> None:
     assert genuine.official_event_at == "2024-12-30T11:30:00+00:00"
 
 
+def test_legacy_launch_table_maps_exact_symbol_and_time() -> None:
+    row = _announcement(
+        [
+            "USDⓈ- M Perpetual Contracts",
+            "ABCUSDT",
+            "Launch Time",
+            "2024-12-30 11:30 (UTC)",
+            "Multi-Asset Mode Supported",
+        ]
+    )
+    assert row.official_event_at == "2024-12-30T11:30:00+00:00"
+
+
 @pytest.mark.parametrize(
     "title",
     [

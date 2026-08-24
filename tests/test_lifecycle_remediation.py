@@ -985,7 +985,16 @@ def test_oracle_module_has_no_production_parser_or_builder_dependency() -> None:
     assert "build_lifecycle_catalog" not in source
 
 
-@pytest.mark.parametrize("mutation", ["wrong_symbol_archive", "wrong_manifest_lineage"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_symbol_archive",
+        "wrong_manifest_lineage",
+        "wrong_manifest_role",
+        "wrong_archive_date",
+        "wrong_manifest_hash",
+    ],
+)
 def test_oracle_rejects_mislabeled_trade_primitive(
     tmp_path: Path, mutation: str
 ) -> None:
@@ -996,15 +1005,28 @@ def test_oracle_rejects_mislabeled_trade_primitive(
         episode["records"][0]["archive_object_key"] = (
             "data/futures/um/daily/trades/BBBUSDT/BBBUSDT-trades-2020-01-01.zip"
         )
-    else:
+    elif mutation in {
+        "wrong_manifest_lineage",
+        "wrong_manifest_role",
+        "wrong_manifest_hash",
+    }:
         primitive_path = tmp_path / "primitive_evidence_manifest.json"
         primitive = json.loads(primitive_path.read_text())
-        primitive["entries"][0]["source_identifier"] = "wrong-archive"
+        if mutation == "wrong_manifest_lineage":
+            primitive["entries"][0]["source_identifier"] = "wrong-archive"
+        elif mutation == "wrong_manifest_role":
+            primitive["entries"][0]["evidence_role"] = (
+                "episode_first_observed_trade_zip"
+            )
+        else:
+            primitive["entries"][0]["sha256"] = "0" * 64
         primitive_core = {
             key: value for key, value in primitive.items() if key != "manifest_id"
         }
         primitive["manifest_id"] = content_identity(primitive_core)
         primitive_path.write_text(json.dumps(primitive))
+    else:
+        episode["records"][0]["archive_date"] = "2020-01-02"
     episode_core = {key: value for key, value in episode.items() if key != "evidence_id"}
     episode["evidence_id"] = content_identity(episode_core)
     episode_path.write_text(json.dumps(episode))

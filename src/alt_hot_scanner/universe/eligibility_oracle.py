@@ -150,6 +150,11 @@ def derive_expected_eligibility(report_root: str | Path) -> dict[str, Any]:
             episode_id = spec["episode_id"]
             trade = trade_by_episode.get(episode_id)
             cutoff = cutoff_by_episode.get(episode_id)
+            expected_primitive_role = (
+                "first_observed_trade_zip"
+                if position == 0
+                else "episode_first_observed_trade_zip"
+            )
             conflict = None
             if (
                 trade is None
@@ -168,7 +173,7 @@ def derive_expected_eligibility(report_root: str | Path) -> dict[str, Any]:
                 or primitive_by_path[str(Path(trade["raw_path"]).resolve())].get(
                     "evidence_role"
                 )
-                not in {"first_observed_trade_zip", "episode_first_observed_trade_zip"}
+                != expected_primitive_role
                 or primitive_by_path[str(Path(trade["raw_path"]).resolve())].get(
                     "source_identifier"
                 )

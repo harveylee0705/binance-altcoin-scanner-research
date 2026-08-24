@@ -120,3 +120,51 @@ def test_mixed_iso_precision_in_lifecycle_anchors_is_supported() -> None:
         }
     )
     assert apply_point_in_time_eligibility(bars, contracts)["is_eligible"].all()
+
+
+def test_relisting_intervals_block_gaps_and_reset_thirty_day_age() -> None:
+    times = pd.to_datetime(
+        [
+            "2022-12-31T23:59:59Z",
+            "2023-02-01T00:00:00Z",
+            "2023-03-01T00:00:00Z",
+            "2023-03-20T00:00:00Z",
+            "2023-04-30T23:59:59.999Z",
+            "2023-05-01T00:00:00Z",
+        ],
+        utc=True,
+        format="mixed",
+    )
+    bars = pd.DataFrame({"symbol": "AAAUSDT", "close_time": times, "close": 1.0})
+    intervals = [
+        {
+            "symbol": "AAAUSDT",
+            "lifecycle_episode_id": "AAAUSDT:1",
+            "age_live_anchor_at": "2023-01-01T00:00:00Z",
+            "anchor_basis": "exact_official_original_launch",
+            "eligibility_end_at": "2023-03-01T00:00:00Z",
+            "last_trading_at": "2023-03-10T00:00:00Z",
+        },
+        {
+            "symbol": "AAAUSDT",
+            "lifecycle_episode_id": "AAAUSDT:2",
+            "age_live_anchor_at": "2023-04-01T00:00:00Z",
+            "anchor_basis": "exact_official_relisting_launch",
+            "eligibility_end_at": None,
+            "last_trading_at": None,
+        },
+    ]
+    contracts = pd.DataFrame(
+        {
+            "symbol": ["AAAUSDT"],
+            "eligibility_age_anchor_at": ["2023-01-01T00:00:00Z"],
+            "eligibility_age_anchor_basis": ["exact_official_original_launch"],
+            "delisting_announcement_published_at": [None],
+            "scope_classification_status": ["resolved"],
+            "scope_disposition": ["in_scope_crypto_perpetual"],
+            "lifecycle_intervals": [intervals],
+        }
+    )
+    result = apply_point_in_time_eligibility(bars, contracts)
+    assert result["is_eligible"].tolist() == [False, True, False, False, False, True]
+    assert result.loc[result.index[-1], "selected_lifecycle_episode_id"] == "AAAUSDT:2"

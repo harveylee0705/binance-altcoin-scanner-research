@@ -14,7 +14,10 @@ from alt_hot_scanner.data.binance_public import (
     validate_archive_object_key,
     write_json_exclusive,
 )
-from alt_hot_scanner.universe.authorization import verify_bound_plan
+from alt_hot_scanner.universe.authorization import (
+    verify_bound_plan,
+    verify_runtime_matches_approved_commit,
+)
 
 
 def key_fields(object_key: str) -> dict[str, str]:
@@ -89,6 +92,10 @@ def main() -> None:
     plan_path = root / args.plan
     verified_plan = verify_bound_plan(plan_path)
     plan = verified_plan["plan"]
+    approved_commit = verified_plan["verified_approval"]["approval"][
+        "lifecycle_evidence_code_commit"
+    ]
+    verify_runtime_matches_approved_commit(root, approved_commit)
     if args.limit is not None and args.limit < 0:
         raise ValueError("--limit must not be negative")
     selected = plan["objects"][: args.limit]
@@ -100,6 +107,7 @@ def main() -> None:
         print("Dry run only. Pass --execute to begin downloads.")
         return
 
+    verify_runtime_matches_approved_commit(root, approved_commit)
     raw_root = root / "data" / "raw"
     attempts: list[dict] = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:

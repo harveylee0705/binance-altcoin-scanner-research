@@ -78,12 +78,17 @@ The prepared full-data path is resumable and deliberately requires an execution 
 Before preparing or executing full history, build and review the lifecycle catalog:
 
 ```powershell
-.venv\Scripts\python scripts/build_lifecycle_catalog.py
+.venv\Scripts\python scripts/build_lifecycle_catalog.py `
+  --scope-registry config/reviewed_scope_registry_b323b3c3.json `
+  --adjudications config/lifecycle_adjudications_v1.json
 ```
 
-The command is metadata-only and writes an auditable catalog, raw-source checksums, coverage report,
-and unresolved queue. See [`docs/LIFECYCLE_CATALOG.md`](docs/LIFECYCLE_CATALOG.md). Full-history
-download remains separately prohibited until the lifecycle/integrity gate is accepted.
+The command is metadata-only. It requires a separately reviewed scope registry for the exact
+candidate digest; it cannot generate reviewed negative classifications. It writes an auditable
+catalog, lifecycle intervals, primitive-evidence manifest, full replay report, raw-source checksums,
+coverage report, and unresolved queue. See
+[`docs/LIFECYCLE_CATALOG.md`](docs/LIFECYCLE_CATALOG.md). Full-history download remains separately
+prohibited until the lifecycle/integrity gate is accepted.
 
 ```powershell
 # Dry-run validation only (safe default)
@@ -96,8 +101,11 @@ download remains separately prohibited until the lifecycle/integrity gate is acc
   --attempt-manifest data/raw/manifests/full_download_attempts_<RUN_ID>.json
 ```
 
-The downloader first re-verifies the exact plan schema, lifecycle bundle, artifact/config hashes,
-recomputed readiness, and observed approved object set. It then accepts only the exact Binance USD-M
+The downloader first re-verifies the exact plan schema, lifecycle bundle, primitive/full-replay and
+review artifact hashes, approval state (`active`, not revoked/superseded), config, approved executable
+commit, recomputed readiness, and observed approved object set. The commit check runs at dry-run
+acceptance and again immediately before execution; later documentation-only commits are allowed. It
+then accepts only the exact Binance USD-M
 monthly 1H key grammar, writes remote bytes to
 an isolated temporary file, verifies the named checksum sidecar, and atomically installs with
 no-replace semantics. It writes successes, missing objects, and classified failures to an exclusive

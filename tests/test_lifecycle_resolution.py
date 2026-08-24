@@ -22,6 +22,7 @@ from alt_hot_scanner.data.binance_public import (
 from alt_hot_scanner.data.provenance import record_new_snapshot_provenance
 from alt_hot_scanner.universe.authorization import (
     APPROVAL_SCHEMA_VERSION,
+    APPROVAL_STATE_SCHEMA_VERSION,
     content_identity,
     sha256_path,
     verify_approval_pin,
@@ -33,10 +34,10 @@ from alt_hot_scanner.universe.checkpoint import (
 from alt_hot_scanner.universe.eligibility import apply_point_in_time_eligibility
 from alt_hot_scanner.universe.lifecycle import build_lifecycle_catalog
 from alt_hot_scanner.universe.scope_registry import (
-    build_historical_scope_registry,
     candidate_set_digest,
     verify_scope_registry,
 )
+from tests.scope_registry_fixtures import build_reviewed_scope_registry_fixture
 
 S3_NAMESPACE = "http://s3.amazonaws.com/doc/2006-03-01/"
 
@@ -331,13 +332,12 @@ def test_scope_registry_is_candidate_bound_and_uses_reviewed_negatives() -> None
             _exchange_item("龙虾USDT", subtype=["Chinese"]),
         ]
     }
-    registry = build_historical_scope_registry(
+    registry = build_reviewed_scope_registry_fixture(
         candidates,
         payload,
-        stablecoin_underlyings=["USDT", "USTC"],
         audited_at="2026-01-01T00:00:00+00:00",
     )
-    records = verify_scope_registry(registry, candidates)
+    records = verify_scope_registry(registry, candidates, require_independent_review=False)
     assert registry["candidate_set_digest"] == candidate_set_digest(candidates)
     assert records["USTCUSDT"]["product_scope"] == "excluded_stablecoin"
     assert records["FRAXUSDT"]["product_scope"] == "excluded_stablecoin"
@@ -348,7 +348,9 @@ def test_scope_registry_is_candidate_bound_and_uses_reviewed_negatives() -> None
     assert records["SYRUPUSDT"]["product_scope"] == "in_scope_crypto_perpetual"
     assert records["龙虾USDT"]["safe_storage_component"].isascii()
     with pytest.raises(ValueError, match="candidate identities changed"):
-        verify_scope_registry(registry, [*candidates, "NEWUSDT"])
+        verify_scope_registry(
+            registry, [*candidates, "NEWUSDT"], require_independent_review=False
+        )
 
 
 def _checkpoint_fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -436,6 +438,7 @@ def test_approval_pin_rejects_missing_stale_and_changed_review(tmp_path: Path) -
         "config": {"sha256": "c" * 64},
     }
     verified = {"bundle": bundle}
+    state_path = tmp_path / "approval-state.json"
     core = {
         "schema_version": APPROVAL_SCHEMA_VERSION,
         "lifecycle_bundle_id": bundle["bundle_id"],
@@ -447,13 +450,27 @@ def test_approval_pin_rejects_missing_stale_and_changed_review(tmp_path: Path) -
             "sha256": sha256_path(review),
         },
         "approval_purpose": "full_history_acquisition_after_lifecycle_audit",
-        "approval_status": "approved",
+        "approval_status": "active",
+        "approval_state_registry": {"path": str(state_path.resolve())},
         "approved_at": "2026-01-01T00:00:00+00:00",
     }
     approval = {**core, "approval_id": content_identity(core)}
+    state_core = {
+        "schema_version": APPROVAL_STATE_SCHEMA_VERSION,
+        "approvals": {
+            approval["approval_id"]: {
+                "status": "active",
+                "superseded_by": None,
+                "reason": "fixture",
+            }
+        },
+    }
+    state_path.write_text(
+        json.dumps({**state_core, "registry_id": content_identity(state_core)})
+    )
     path = tmp_path / "approval.json"
     path.write_text(json.dumps(approval))
-    assert verify_approval_pin(path, verified)["approval"]["approval_status"] == "approved"
+    assert verify_approval_pin(path, verified)["approval"]["approval_status"] == "active"
     with pytest.raises(FileNotFoundError):
         verify_approval_pin(tmp_path / "no-real-approval.json", verified)
     review.write_text("changed")

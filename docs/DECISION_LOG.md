@@ -164,3 +164,20 @@ Reason: the final independent gate at `2f9d8ab` identified five remaining acquis
 blockers. Scanner features, HotScore, structure and outcome definitions, episodes, baselines,
 chronological splits, and advancement criteria remain frozen. No validation/holdout inspection,
 performance analysis, or full-history acquisition is authorized.
+# 2026-08-24 — Genuine delist/relist lifecycle episodes
+
+Decision (made before any scanner-outcome inspection): when official evidence establishes that the
+same Binance Futures symbol had an initial live interval, a genuine termination, and a later
+genuine relisting, represent those periods as separate lifecycle episodes. Never treat the symbol
+as continuously tradable through the terminated interval.
+
+Each relisted episode has its own conservative live boundary and its own 30-calendar-day minimum-age
+clock. Signals before that boundary, during a terminated gap, or during the first 30 calendar days
+of the new episode are ineligible. A known delisting-announcement publication cutoff applies only to
+the episode addressed by that announcement.
+
+A current status that disagrees with an old article is not sufficient to infer a relisting. The
+evidence review must first distinguish an incorrect article match, another product, a temporary
+operational event, a true perpetual-contract termination, and a genuine relist. Unresolved cases
+remain fail-closed. This is a conservative point-in-time universe rule under the frozen local
+research threat model; it does not add signing keys, PKI, or remote attestation.

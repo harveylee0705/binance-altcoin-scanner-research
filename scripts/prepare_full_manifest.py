@@ -94,6 +94,11 @@ def prepare_plan_payload(
         "lifecycle_bundle_id": bundle["bundle_id"],
         "lifecycle_approval": str(Path(approval_path).resolve()),
         "lifecycle_approval_id": verified_approval["approval"]["approval_id"],
+        "approval_state_registry": {
+            "path": str(verified_approval["state_registry_path"].resolve()),
+            "sha256": verified_approval["state_registry_sha256"],
+            "registry_id": verified_approval["state_registry"]["registry_id"],
+        },
         "artifact_hashes": {
             name: descriptor["sha256"] for name, descriptor in bundle["artifacts"].items()
         },

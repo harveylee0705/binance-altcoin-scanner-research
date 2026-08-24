@@ -1049,6 +1049,36 @@ def observed_zip_keys_from_index_snapshots(
     return tuple(sorted(keys))
 
 
+def observed_daily_trade_keys_from_index_snapshots(
+    paths: list[str] | tuple[str, ...], symbol: str
+) -> tuple[str, ...]:
+    """Recover exact daily trade ZIP identities from complete preserved S3 index pages."""
+    semantic_symbol = require_semantic_contract_identity(symbol, "daily trade index symbol")
+    namespace_uri = "http://s3.amazonaws.com/doc/2006-03-01/"
+    keys: set[str] = set()
+    for raw_path in paths:
+        try:
+            root = ET.fromstring(Path(raw_path).read_bytes())
+        except (OSError, ET.ParseError) as exc:
+            raise ValueError(f"Cannot parse preserved daily trade index {raw_path}") from exc
+        if root.tag != f"{{{namespace_uri}}}ListBucketResult":
+            raise ValueError("Preserved daily trade index has an unexpected namespace")
+        truncated = root.findall(f"{{{namespace_uri}}}IsTruncated")
+        if len(truncated) != 1 or truncated[0].text not in {"true", "false"}:
+            raise ValueError("Daily trade index has an invalid truncation marker")
+        for node in root.findall(f"{{{namespace_uri}}}Contents/{{{namespace_uri}}}Key"):
+            key = node.text
+            if not key or key.endswith(".CHECKSUM"):
+                continue
+            identity = validate_daily_trade_object_key(key)
+            if identity.symbol != semantic_symbol:
+                raise ValueError("Daily trade index contains a mismatched symbol")
+            keys.add(identity.object_key)
+    if not keys:
+        raise ValueError(f"No daily trade ZIP objects found for {semantic_symbol}")
+    return tuple(sorted(keys))
+
+
 def fetch_exchange_info_snapshot(path: str | Path) -> dict:
     """Capture current exchange information verbatim; never treat it as historical membership."""
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"

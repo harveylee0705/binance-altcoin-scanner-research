@@ -20,7 +20,10 @@ from alt_hot_scanner.data.binance_public import (
     discover_archive_months,
     discover_archive_symbol_candidates,
     fetch_exchange_info_snapshot,
+    list_archive_index,
+    observed_daily_trade_keys_from_index_snapshots,
     sha256_file,
+    validate_daily_trade_object_key,
     verify_first_observed_trade_record,
     write_bytes_exclusive,
     write_json_exclusive,
@@ -30,6 +33,11 @@ from alt_hot_scanner.data.provenance import (
     record_new_snapshot_provenance,
 )
 from alt_hot_scanner.identity import safe_identity_component
+from alt_hot_scanner.universe.adjudications import (
+    BOUNDARY_INDEX_SCHEMA_VERSION,
+    load_lifecycle_adjudications,
+    verify_boundary_index,
+)
 from alt_hot_scanner.universe.authorization import (
     build_bundle_payload,
     catalog_readiness,
@@ -39,9 +47,14 @@ from alt_hot_scanner.universe.checkpoint import (
     verify_archive_checkpoint,
 )
 from alt_hot_scanner.universe.contracts import records_from_exchange_info
+from alt_hot_scanner.universe.evidence_replay import (
+    build_primitive_evidence_manifest,
+    run_full_evidence_replay,
+)
 from alt_hot_scanner.universe.lifecycle import build_lifecycle_catalog, catalog_coverage
 from alt_hot_scanner.universe.scope_registry import (
-    build_historical_scope_registry,
+    build_candidate_inventory,
+    candidate_inventory_difference,
     verify_scope_registry,
 )
 from alt_hot_scanner.utils.config import load_config
@@ -56,6 +69,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume-run",
         help="Resume a run ID that reached the archive checkpoint; evidence is never replaced",
+    )
+    parser.add_argument("--scope-registry", required=True, help="Exact independently reviewed registry")
+    parser.add_argument(
+        "--adjudications", required=True, help="Exact reviewed lifecycle adjudication file"
     )
     return parser.parse_args()
 
@@ -174,12 +191,33 @@ def main() -> None:
     )
 
     all_candidates = sorted([*symbols, *quarantined_prefixes])
-    scope_registry = build_historical_scope_registry(
+    candidate_inventory = build_candidate_inventory(
         all_candidates,
-        exchange_payload,
-        stablecoin_underlyings=config["universe"]["stablecoin_underlyings"],
+        discovered_at=discovered_at.isoformat(),
+        source_identifier="official_binance_monthly_1h_archive_prefix_inventory",
     )
-    scope_by_identity = verify_scope_registry(scope_registry, all_candidates)
+    scope_registry_path = Path(args.scope_registry).resolve(strict=True)
+    scope_registry = json.loads(scope_registry_path.read_text(encoding="utf-8"))
+    if scope_registry.get("candidate_set_digest") != candidate_inventory[
+        "candidate_set_digest"
+    ]:
+        report_root.mkdir(parents=True, exist_ok=False)
+        write_json_exclusive(report_root / "candidate_inventory.json", candidate_inventory)
+        write_json_exclusive(
+            report_root / "candidate_scope_review_required.json",
+            candidate_inventory_difference(candidate_inventory, scope_registry),
+        )
+        raise RuntimeError("Candidate digest changed; independent scope review is required")
+    scope_by_identity = verify_scope_registry(
+        scope_registry,
+        all_candidates,
+        registry_path=scope_registry_path,
+        repository_root=root,
+    )
+    lifecycle_adjudications = load_lifecycle_adjudications(
+        Path(args.adjudications),
+        candidate_set_digest=candidate_inventory["candidate_set_digest"],
+    )
     unicode_in_scope = [
         identity
         for identity in quarantined_prefixes
@@ -236,6 +274,55 @@ def main() -> None:
         write_bytes_exclusive(probe_checkpoint, _json_bytes(first_trade_records))
     first_trade_frame = pd.DataFrame.from_records(first_trade_records)
 
+    boundary_rows: list[dict[str, Any]] = []
+    for symbol, adjudication in sorted(lifecycle_adjudications["by_symbol"].items()):
+        if not adjudication.get("gap_evidence"):
+            continue
+        safe_symbol = safe_identity_component(symbol)
+        boundary_root = raw_root / "daily_trade_boundary_index"
+        existing_paths = sorted(boundary_root.glob(f"{safe_symbol}_page_*.xml"))
+
+        def save_boundary_page(
+            page: int,
+            url: str,
+            payload: bytes,
+            boundary_root: Path = boundary_root,
+            safe_symbol: str = safe_symbol,
+        ) -> None:
+            digest = hashlib.sha256(payload).hexdigest()
+            path = boundary_root / f"{safe_symbol}_page_{page:03d}_{digest[:16]}.xml"
+            if path.exists():
+                load_snapshot_provenance(path, expected_url=url, expected_sha256=digest)
+                return
+            write_bytes_exclusive(path, payload)
+            record_new_snapshot_provenance(
+                path, url=url, parser_version="binance-daily-trade-index-boundary-v1"
+            )
+
+        if not existing_paths:
+            list_archive_index(
+                f"data/futures/um/daily/trades/{symbol}/",
+                page_observer=save_boundary_page,
+            )
+            existing_paths = sorted(boundary_root.glob(f"{safe_symbol}_page_*.xml"))
+        keys = observed_daily_trade_keys_from_index_snapshots(
+            [str(path.resolve()) for path in existing_paths], symbol
+        )
+        dates = sorted({validate_daily_trade_object_key(key).period for key in keys})
+        boundary_rows.append(
+            {
+                "schema_version": BOUNDARY_INDEX_SCHEMA_VERSION,
+                "symbol": symbol,
+                "source_identifier": f"data/futures/um/daily/trades/{symbol}/",
+                "raw_snapshot_paths": [str(path.resolve()) for path in existing_paths],
+                "raw_snapshot_sha256s": [sha256_file(path)[0] for path in existing_paths],
+                "observed_archive_dates": dates,
+                "observed_archive_keys": list(keys),
+                "parser_version": "binance-daily-trade-index-boundary-v1",
+            }
+        )
+    verify_boundary_index(lifecycle_adjudications, boundary_rows)
+
     announcement_frame, announcement_audit = acquire_announcement_corpus(
         raw_root / "announcements", set(symbols)
     )
@@ -246,6 +333,7 @@ def main() -> None:
         announcement_search_completed=True,
         first_observed_trades=first_trade_frame,
         scope_registry_records=scope_registry["records"],
+        lifecycle_adjudications=lifecycle_adjudications,
     )
     coverage = catalog_coverage(catalog)
     noncanonical_usdt = sum(symbol.endswith("USDT") for symbol in quarantined_prefixes)
@@ -281,6 +369,9 @@ def main() -> None:
     coverage["announcement_corpus"] = announcement_audit
     coverage["scope_registry"] = {
         "candidate_set_digest": scope_registry["candidate_set_digest"],
+        "registry_payload_id": scope_registry["registry_payload_id"],
+        "registry_id": scope_registry["registry_id"],
+        "independent_review_id": scope_registry["independent_review"]["identifier"],
         "stablecoin_positive_exclusions": len(
             scope_registry["stablecoin_positive_exclusions"]
         ),
@@ -291,6 +382,15 @@ def main() -> None:
             scope_registry["noncrypto_index_composite_exclusions"]
         ),
         "unresolved": len(scope_registry["unresolved_identities"]),
+    }
+    coverage["lifecycle_adjudications"] = {
+        "adjudication_id": lifecycle_adjudications["adjudication_id"],
+        "reviewed_symbols": sorted(lifecycle_adjudications["by_symbol"]),
+        "genuine_relisting_symbols": sorted(
+            symbol
+            for symbol, record in lifecycle_adjudications["by_symbol"].items()
+            if len(record["episodes"]) > 1
+        ),
     }
     coverage["exchange_info_provenance"] = {
         "sha256": exchange_sha256,
@@ -312,6 +412,7 @@ def main() -> None:
     }
 
     report_root.mkdir(parents=True, exist_ok=False)
+    write_json_exclusive(report_root / "candidate_inventory.json", candidate_inventory)
     write_bytes_exclusive(
         report_root / "archive_observations.json", _json_bytes(archive_frame.to_dict("records"))
     )
@@ -320,7 +421,16 @@ def main() -> None:
         _json_bytes(announcement_frame.to_dict("records")),
     )
     write_json_exclusive(report_root / "announcement_corpus_audit.json", announcement_audit)
-    write_json_exclusive(report_root / "historical_scope_registry.json", scope_registry)
+    write_bytes_exclusive(
+        report_root / "historical_scope_registry.json", scope_registry_path.read_bytes()
+    )
+    write_bytes_exclusive(
+        report_root / "lifecycle_adjudications.json",
+        lifecycle_adjudications["path"].read_bytes(),
+    )
+    write_bytes_exclusive(
+        report_root / "lifecycle_daily_trade_boundaries.json", _json_bytes(boundary_rows)
+    )
     write_bytes_exclusive(
         report_root / "first_observed_trades.json", _json_bytes(first_trade_records)
     )
@@ -375,6 +485,16 @@ def main() -> None:
                 "leveraged_conflict_status",
             ),
         ):
+            direct = next(
+                (
+                    item
+                    for item in row["evidence"]
+                    if item.get("evidence_class") == "direct_positive_exclusion"
+                    and item.get("exclusion_class")
+                    == ("stablecoin" if dimension == "stablecoin_underlying" else "leveraged_token")
+                ),
+                None,
+            )
             classification_evidence.append(
                 {
                     "asset": row["base_asset"] if dimension == "stablecoin_underlying" else row["contract_identity"],
@@ -382,12 +502,13 @@ def main() -> None:
                     "dimension": dimension,
                     "value": row[value_field],
                     "source_type": "candidate_set_bound_historical_scope_registry",
-                    "source_identifier": scope_registry["candidate_set_digest"],
-                    "source_url": EXCHANGE_INFO_URL,
+                    "source_identifier": scope_registry["registry_id"],
+                    "source_url": direct["source_url"] if direct is not None else None,
                     "raw_snapshot_sha256": exchange_sha256,
                     "reviewed_parser_version": scope_registry["reviewer_parser_version"],
                     "evidence_status": row[status_field],
                     "conflict_status": "none",
+                    "positive_exclusion_evidence": direct,
                 }
             )
     write_bytes_exclusive(
@@ -458,6 +579,20 @@ def main() -> None:
             "catalog_schema_version": coverage["catalog_schema_version"],
         },
     )
+    primitive_manifest = build_primitive_evidence_manifest(
+        raw_root, first_trades=first_trade_records
+    )
+    write_json_exclusive(
+        report_root / "primitive_evidence_manifest.json", primitive_manifest
+    )
+    full_replay = run_full_evidence_replay(
+        report_root,
+        repository_root=root,
+        lifecycle_adjudications=lifecycle_adjudications,
+    )
+    write_json_exclusive(
+        report_root / "full_evidence_verification_report.json", full_replay
+    )
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=root,
@@ -479,6 +614,11 @@ def main() -> None:
             "historical_scope_registry.json",
             "first_observed_trades.json",
             "announcement_corpus_audit.json",
+            "candidate_inventory.json",
+            "lifecycle_adjudications.json",
+            "lifecycle_daily_trade_boundaries.json",
+            "primitive_evidence_manifest.json",
+            "full_evidence_verification_report.json",
         ],
         code_commit=commit,
         created_at=datetime.now(UTC).isoformat(),

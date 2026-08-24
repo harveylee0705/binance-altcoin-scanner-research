@@ -34,6 +34,10 @@ _DIRECT_SYMBOL = re.compile(
     r"(?<![A-Z0-9])([A-Z0-9]{2,60}(?:USDT|BUSD|USDC))(?![A-Z0-9])"
 )
 _SLASH_SYMBOL = re.compile(r"(?<![A-Z0-9])([A-Z0-9]{1,60})\s*/\s*USDT(?![A-Z0-9])")
+_USDT_MARGINED_SYMBOL = re.compile(
+    r"(?<![A-Z0-9])([A-Z0-9]{1,60})\s+USDT-Margined\s+Contracts?\b",
+    re.IGNORECASE,
+)
 _DATE_FIRST = re.compile(
     r"(?P<date>20\d{2}[-/]\d{2}[-/]\d{2})\s+(?:at\s+)?"
     r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s*(?P<ampm>AM|PM)?\s*\(UTC\)",
@@ -119,6 +123,8 @@ def _symbols_in_order(text: str, archive_symbols: set[str]) -> list[str]:
         matches.append((match.start(), match.group(1)))
     for match in _SLASH_SYMBOL.finditer(text):
         matches.append((match.start(), f"{match.group(1)}USDT"))
+    for match in _USDT_MARGINED_SYMBOL.finditer(text):
+        matches.append((match.start(), f"{match.group(1).upper()}USDT"))
     ordered: list[str] = []
     for _, symbol in sorted(matches):
         if symbol in archive_symbols and symbol not in ordered:
@@ -147,7 +153,7 @@ _LAUNCH_ACTION = re.compile(
     re.IGNORECASE,
 )
 _DELIST_ACTION = re.compile(
-    r"\b(?:will\s+)?(?:delist|cease\s+trading|settle|close\s+all\s+positions|"
+    r"\b(?:will\s+)?(?:delist(?:ing)?|cease\s+trading|settle|close\s+all\s+positions|"
     r"terminate(?:s|d)?\s+(?:the\s+)?contract)\b",
     re.IGNORECASE,
 )
@@ -167,8 +173,14 @@ def classify_article_semantics(title: str, body_text: str) -> str:
         return "portfolio_margin_or_multi_asset_enablement"
     if "pre-market" in title_lower or "pre market" in title_lower:
         return "pre_market_or_other_product_enablement"
-    title_futures_product = "binance futures" in title_lower or "usdⓢ-m futures" in title_lower
-    title_perpetual_product = "perpetual" in title_lower and "contract" in title_lower
+    title_futures_product = "binance futures" in title_lower or "usdⓢ-m" in title_lower
+    title_perpetual_product = "contract" in title_lower and (
+        "perpetual" in title_lower
+        or "usdt-margined" in title_lower
+        or "usdⓢ-m" in title_lower
+    )
+    if "coin-margined" in title_lower or "coin-m" in title_lower:
+        return "irrelevant"
     if title_futures_product and title_perpetual_product and _DELIST_ACTION.search(title_lower):
         return "delisting_or_settlement"
     if any(
@@ -193,6 +205,10 @@ def classify_article_semantics(title: str, body_text: str) -> str:
         return "copy_trading_enablement"
     if "trading bot" in combined or "futures grid" in combined:
         return "trading_bot_enablement"
+    # A spot/margin delisting article can mention an unaffected Futures contract in its body.
+    # Such a cross-product mention must never become Futures termination evidence.
+    if _DELIST_ACTION.search(combined):
+        return "irrelevant"
     futures_product = "binance futures" in combined or "usdⓢ-m futures" in combined
     perpetual_product = "perpetual" in combined and "contract" in combined
     if futures_product and perpetual_product and _DELIST_ACTION.search(combined):
@@ -233,7 +249,8 @@ def _action_anchored_event_times(
     action = _LAUNCH_ACTION if semantic_class == "original_perpetual_launch" else _DELIST_ACTION
     mapped: dict[str, pd.Timestamp | None] = {symbol: None for symbol in symbols}
     candidates: dict[str, list[pd.Timestamp]] = {symbol: [] for symbol in symbols}
-    segments = _segments(text[:8000])
+    bounded = text[:8000]
+    segments = [*_segments(bounded), *_segments(re.sub(r"\s+", " ", bounded))]
     action_context = False
     for segment in segments:
         segment_symbols = [
@@ -249,13 +266,28 @@ def _action_anchored_event_times(
         residual = re.sub(r"\b(?:and|or|UTC)\b|[\s:;,()\-/]", "", residual, flags=re.IGNORECASE)
         # A carried launch header is allowed only for a bare symbol/time table row.
         # Any product, operational, or enablement prose terminates the context.
+        mixed_purpose = any(
+            marker in segment.lower()
+            for marker in (
+                "copy trading",
+                "trading bot",
+                "futures grid",
+                "maintenance",
+                "system upgrade",
+                "temporary suspension",
+                "multi-assets",
+                "portfolio margin",
+            )
+        )
         structured_row = (
             action_context
             and bool(segment_symbols)
             and len(times) == 1
             and residual == ""
         )
-        explicit_shared = has_action and bool(segment_symbols) and len(times) == 1
+        explicit_shared = (
+            has_action and bool(segment_symbols) and len(times) == 1 and not mixed_purpose
+        )
         if structured_row or explicit_shared:
             for symbol in segment_symbols:
                 candidates[symbol].append(times[0])
@@ -267,6 +299,20 @@ def _action_anchored_event_times(
         unique = list(dict.fromkeys(values))
         if len(unique) == 1:
             mapped[symbol] = unique[0]
+    # Recent official launch articles encode each row as a timestamp line immediately
+    # followed by an exact symbol and "Perpetual Contract". This is an explicit local
+    # symbol/time structure, not a positional table/count inference.
+    if semantic_class == "original_perpetual_launch":
+        structured = re.compile(
+            r"(?P<date>20\d{2}[-/]\d{2}[-/]\d{2})\s+"
+            r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s*(?P<ampm>AM|PM)?\s*\(UTC\)\s*:?\s*"
+            r"(?P<symbol>[A-Z0-9]{2,60}(?:USDT|USDC|BUSD))\s+Perpetual\s+Contract",
+            re.IGNORECASE,
+        )
+        for match in structured.finditer(re.sub(r"\s+", " ", bounded)):
+            symbol = match.group("symbol").upper()
+            if symbol in mapped and symbol in archive_symbols:
+                mapped[symbol] = _parse_timestamp(match)
     return mapped
 
 
@@ -397,7 +443,7 @@ def acquire_announcement_corpus(
     rebuild_started_at = datetime.now(UTC).isoformat()
     evidence: list[AnnouncementEvidence] = []
     audit_catalogs: list[dict[str, Any]] = []
-    detail_seen: set[str] = set()
+    detail_seen: set[tuple[str, str]] = set()
     network_request_count = 0
 
     def read_source(url: str, pattern: str) -> bytes:
@@ -472,9 +518,10 @@ def acquire_announcement_corpus(
         ]
         for candidate_position, article in enumerate(candidates, start=1):
             code = require_canonical_text(article.get("code"), "article code")
-            if code in detail_seen:
+            detail_key = (event_type, code)
+            if detail_key in detail_seen:
                 continue
-            detail_seen.add(code)
+            detail_seen.add(detail_key)
             url = f"{ANNOUNCEMENT_API}/detail/query?articleCode={code}"
             article_pattern = f"article_{code}_*.json"
             article_was_cached = bool(list(root.glob(article_pattern)))

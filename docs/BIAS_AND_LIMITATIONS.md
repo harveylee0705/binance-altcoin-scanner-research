@@ -30,6 +30,12 @@ Search engines and third-party pages may locate an official article but never be
 authority. Multiple official articles for one symbol/event are marked ambiguous instead of silently
 collapsed; this is also the relisting/reused-symbol safeguard.
 
+Genuine termination/relisting evidence is represented as multiple non-overlapping lifecycle
+intervals. No scanner row is eligible in the terminated gap, and a relisted episode must accumulate
+30 full calendar days from its own conservative live boundary. Articles for Spot, Margin, Delivery,
+or COIN-margined products cannot terminate a USD-M perpetual merely because the body mentions the
+same asset.
+
 ## Leakage controls
 
 - Features are grouped by symbol, sorted by time, and use only current/prior completed data.
@@ -68,6 +74,18 @@ checksum-verified first Futures trade, or an explicitly adjudicated legacy bound
 renamed as an exact launch. The 30-day minimum age is fixed and does not change based on outcomes.
 `deliveryDate` may be a far-future sentinel for active perpetuals and must not be interpreted as an
 actual delisting. Current active/delisted status never removes historical rows.
+
+## Approval and acquisition boundary
+
+The approval-time full replay binds and re-hashes raw archive XML, exchangeInfo, CMS catalog/detail
+JSON, provenance sidecars, first-trade ZIPs, and reviewed daily boundary indexes. Runtime download
+validation consumes the approved hashes and content identities rather than repeating that entire
+research replay for every OHLCV object. An approval can be active, revoked, or superseded; only the
+active state authorizes a plan. No real full-history approval is created by lifecycle construction.
+
+Monthly archives stop at the last fully completed UTC month. The current-month tail is deliberately
+not implemented in this milestone, so monthly data alone cannot claim the latest fully completed
+2026 bars during an in-progress month.
 
 ## Contract classification
 

@@ -16,6 +16,7 @@ from alt_hot_scanner.data.provenance import (
 )
 from alt_hot_scanner.universe.authorization import (
     APPROVAL_SCHEMA_VERSION,
+    APPROVAL_STATE_SCHEMA_VERSION,
     PLAN_SCHEMA_VERSION,
     build_bundle_payload,
     build_plan_integrity,
@@ -30,7 +31,11 @@ from alt_hot_scanner.universe.lifecycle import (
     build_lifecycle_catalog,
     catalog_coverage,
 )
-from alt_hot_scanner.universe.scope_registry import build_historical_scope_registry
+from alt_hot_scanner.universe.scope_registry import (
+    SCOPE_REVIEW_SCHEMA_VERSION,
+    scope_registry_identity,
+)
+from tests.scope_registry_fixtures import build_reviewed_scope_registry_fixture
 
 
 def _announcement(
@@ -415,6 +420,9 @@ def test_completed_delisting_search_without_timestamp_does_not_remove_history() 
 
 
 def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
+    (tmp_path / "config").mkdir()
+    review_dir = tmp_path / "docs" / "reviews"
+    review_dir.mkdir(parents=True)
     catalog = build_lifecycle_catalog(
         pd.DataFrame([_archive("AAAUSDT")]),
         pd.DataFrame([_current("AAAUSDT", "TRADING")]),
@@ -456,12 +464,30 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
             }
         ]
     }
-    registry = build_historical_scope_registry(
+    registry = build_reviewed_scope_registry_fixture(
         ["AAAUSDT"],
         exchange_payload,
-        stablecoin_underlyings=["USDT", "USTC"],
         audited_at="2026-01-01T00:00:00+00:00",
     )
+    scope_review_core = {
+        "schema_version": SCOPE_REVIEW_SCHEMA_VERSION,
+        "verdict": "PASS",
+        "candidate_set_digest": registry["candidate_set_digest"],
+        "scope_registry_payload_id": registry["registry_payload_id"],
+    }
+    scope_review = {
+        **scope_review_core,
+        "review_id": content_identity(scope_review_core),
+    }
+    scope_review_path = review_dir / "scope-review.json"
+    scope_review_path.write_text(json.dumps(scope_review))
+    registry["independent_review"] = {
+        "identifier": scope_review["review_id"],
+        "path": "docs/reviews/scope-review.json",
+        "sha256": sha256_path(scope_review_path),
+        "verdict": "PASS",
+    }
+    registry["registry_id"] = scope_registry_identity(registry)
     (tmp_path / "historical_scope_registry.json").write_text(json.dumps(registry))
     (tmp_path / "first_observed_trades.json").write_text("[]")
     (tmp_path / "announcement_corpus_audit.json").write_text(
@@ -478,7 +504,42 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
             }
         )
     )
-    config = tmp_path / "config.yaml"
+    inventory = {
+        "candidate_set_digest": registry["candidate_set_digest"],
+        "candidate_identities": ["AAAUSDT"],
+    }
+    (tmp_path / "candidate_inventory.json").write_text(json.dumps(inventory))
+    adjudication_core = {
+        "schema_version": "lifecycle-adjudications-v1",
+        "candidate_set_digest": registry["candidate_set_digest"],
+        "records": [],
+    }
+    (tmp_path / "lifecycle_adjudications.json").write_text(
+        json.dumps(
+            {
+                **adjudication_core,
+                "adjudication_id": content_identity(adjudication_core),
+            }
+        )
+    )
+    (tmp_path / "lifecycle_daily_trade_boundaries.json").write_text("[]")
+    primitive_core = {"schema_version": "primitive-evidence-manifest-v1", "entries": []}
+    (tmp_path / "primitive_evidence_manifest.json").write_text(
+        json.dumps({**primitive_core, "manifest_id": content_identity(primitive_core)})
+    )
+    replay_core = {
+        "schema_version": "lifecycle-full-evidence-replay-v1",
+        "status": "PASS",
+    }
+    (tmp_path / "full_evidence_verification_report.json").write_text(
+        json.dumps(
+            {
+                **replay_core,
+                "verification_report_id": content_identity(replay_core),
+            }
+        )
+    )
+    config = tmp_path / "config" / "research_v0_1.yaml"
     config.write_text(
         "version: scanner-v0.1\n"
         "universe:\n"
@@ -498,6 +559,11 @@ def _write_bundle(tmp_path: Path) -> tuple[Path, pd.DataFrame]:
         "historical_scope_registry.json",
         "first_observed_trades.json",
         "announcement_corpus_audit.json",
+        "candidate_inventory.json",
+        "lifecycle_adjudications.json",
+        "lifecycle_daily_trade_boundaries.json",
+        "primitive_evidence_manifest.json",
+        "full_evidence_verification_report.json",
     ]
     bundle = build_bundle_payload(
         report_root=tmp_path,
@@ -516,6 +582,7 @@ def _write_plan(tmp_path: Path, bundle_path: Path) -> Path:
     bundle = verified["bundle"]
     review_path = tmp_path / "independent-review.md"
     review_path.write_text("PASS")
+    state_path = tmp_path / "approval-state.json"
     approval_core = {
         "schema_version": APPROVAL_SCHEMA_VERSION,
         "lifecycle_bundle_id": bundle["bundle_id"],
@@ -527,12 +594,25 @@ def _write_plan(tmp_path: Path, bundle_path: Path) -> Path:
             "sha256": sha256_path(review_path),
         },
         "approval_purpose": "full_history_acquisition_after_lifecycle_audit",
-        "approval_status": "approved",
+        "approval_status": "active",
+        "approval_state_registry": {"path": str(state_path.resolve())},
         "approved_at": "2026-01-01T00:00:00+00:00",
     }
     approval = {**approval_core, "approval_id": content_identity(approval_core)}
     approval_path = tmp_path / "fixture-approval.json"
     approval_path.write_text(json.dumps(approval))
+    state_core = {
+        "schema_version": APPROVAL_STATE_SCHEMA_VERSION,
+        "approvals": {
+            approval["approval_id"]: {
+                "status": "active",
+                "superseded_by": None,
+                "reason": "fixture",
+            }
+        },
+    }
+    state_registry = {**state_core, "registry_id": content_identity(state_core)}
+    state_path.write_text(json.dumps(state_registry))
     plan = {
         "schema_version": PLAN_SCHEMA_VERSION,
         "created_at": "2026-01-01T00:00:00+00:00",
@@ -541,6 +621,11 @@ def _write_plan(tmp_path: Path, bundle_path: Path) -> Path:
         "lifecycle_bundle_id": bundle["bundle_id"],
         "lifecycle_approval": str(approval_path.resolve()),
         "lifecycle_approval_id": approval["approval_id"],
+        "approval_state_registry": {
+            "path": str(state_path.resolve()),
+            "sha256": sha256_path(state_path),
+            "registry_id": state_registry["registry_id"],
+        },
         "artifact_hashes": {
             name: descriptor["sha256"] for name, descriptor in bundle["artifacts"].items()
         },

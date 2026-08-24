@@ -3,24 +3,21 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from alt_hot_scanner.data.binance_public import (
-    validate_archive_object_key,
-    verify_first_observed_trade_record,
-)
+from alt_hot_scanner.data.binance_public import validate_archive_object_key
 from alt_hot_scanner.universe.contracts import filter_instrument_scope
 from alt_hot_scanner.universe.lifecycle import CATALOG_SCHEMA_VERSION
 from alt_hot_scanner.universe.scope_registry import verify_scope_registry
 from alt_hot_scanner.utils.config import load_config
 
-BUNDLE_SCHEMA_VERSION = "lifecycle-authorization-bundle-v2"
-APPROVAL_SCHEMA_VERSION = "lifecycle-approval-pin-v1"
-PLAN_SCHEMA_VERSION = "full-history-download-plan-v3"
+BUNDLE_SCHEMA_VERSION = "lifecycle-authorization-bundle-v3"
+APPROVAL_SCHEMA_VERSION = "lifecycle-approval-pin-v2"
+APPROVAL_STATE_SCHEMA_VERSION = "lifecycle-approval-state-registry-v1"
+PLAN_SCHEMA_VERSION = "full-history-download-plan-v4"
 PLAN_FIELDS = {
     "schema_version",
     "created_at",
@@ -30,6 +27,7 @@ PLAN_FIELDS = {
     "lifecycle_bundle_id",
     "lifecycle_approval",
     "lifecycle_approval_id",
+    "approval_state_registry",
     "artifact_hashes",
     "config_sha256",
     "readiness",
@@ -75,6 +73,9 @@ def catalog_readiness(catalog: pd.DataFrame, noncanonical_candidates: list[str])
                 "not_applicable_currently_trading",
                 "exact_applicable_announcement_publication",
                 "official_search_completed_no_reliable_announcement_timestamp",
+                "resolved_multi_episode_currently_trading",
+                "resolved_multi_episode_terminated",
+                "reviewed_terminal_episode",
             ]
         )
     )
@@ -113,6 +114,16 @@ def build_bundle_payload(
         name: {"path": name, "sha256": sha256_path(report_root / name)}
         for name in sorted(artifact_names)
     }
+    scope = json.loads((report_root / "historical_scope_registry.json").read_text("utf-8"))
+    primitive = json.loads(
+        (report_root / "primitive_evidence_manifest.json").read_text("utf-8")
+    )
+    replay = json.loads(
+        (report_root / "full_evidence_verification_report.json").read_text("utf-8")
+    )
+    adjudications = json.loads(
+        (report_root / "lifecycle_adjudications.json").read_text("utf-8")
+    )
     core = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "purpose": "content_bound_lifecycle_authorization",
@@ -124,6 +135,22 @@ def build_bundle_payload(
             "sha256": sha256_path(config_path),
         },
         "code_commit": code_commit,
+        "authorization_chain": {
+            "primitive_evidence_manifest_id": primitive["manifest_id"],
+            "primitive_evidence_manifest_sha256": artifacts[
+                "primitive_evidence_manifest.json"
+            ]["sha256"],
+            "full_evidence_verification_report_id": replay["verification_report_id"],
+            "full_evidence_verification_report_sha256": artifacts[
+                "full_evidence_verification_report.json"
+            ]["sha256"],
+            "reviewed_scope_registry_id": scope["registry_id"],
+            "reviewed_scope_registry_sha256": artifacts[
+                "historical_scope_registry.json"
+            ]["sha256"],
+            "scope_independent_review": scope["independent_review"],
+            "lifecycle_adjudication_id": adjudications["adjudication_id"],
+        },
     }
     return {**core, "bundle_id": content_identity(core)}
 
@@ -141,6 +168,7 @@ def verify_approval_pin(
         "independent_review_artifact",
         "approval_purpose",
         "approval_status",
+        "approval_state_registry",
         "approved_at",
         "approval_id",
     }
@@ -160,15 +188,42 @@ def verify_approval_pin(
         raise ValueError("Lifecycle approval pins the wrong config")
     if approval.get("approval_purpose") != "full_history_acquisition_after_lifecycle_audit":
         raise ValueError("Lifecycle approval has the wrong purpose")
-    if approval.get("approval_status") != "approved":
-        raise ValueError("Lifecycle approval is not approved")
+    if approval.get("approval_status") != "active":
+        raise ValueError("Lifecycle approval pin is not active")
     review = approval.get("independent_review_artifact")
     if type(review) is not dict or set(review) != {"identifier", "path", "sha256"}:
         raise ValueError("Lifecycle approval review artifact is malformed")
     review_path = Path(review["path"])
     if not review_path.is_absolute() or sha256_path(review_path) != review["sha256"]:
         raise ValueError("Lifecycle approval review artifact digest is invalid")
-    return {"approval": approval, "approval_path": path}
+    state_descriptor = approval.get("approval_state_registry")
+    if type(state_descriptor) is not dict or set(state_descriptor) != {"path"}:
+        raise ValueError("Lifecycle approval state-registry descriptor is malformed")
+    state_path = Path(state_descriptor["path"])
+    if not state_path.is_absolute():
+        raise ValueError("Lifecycle approval state registry path must be absolute")
+    state_payload = state_path.read_bytes()
+    state_registry = json.loads(state_payload)
+    if state_registry.get("schema_version") != APPROVAL_STATE_SCHEMA_VERSION:
+        raise ValueError("Lifecycle approval state registry has an unsupported schema")
+    state_core = {key: value for key, value in state_registry.items() if key != "registry_id"}
+    if state_registry.get("registry_id") != content_identity(state_core):
+        raise ValueError("Lifecycle approval state registry identity is invalid")
+    states = state_registry.get("approvals")
+    state = states.get(approval["approval_id"]) if type(states) is dict else None
+    if type(state) is not dict or set(state) != {"status", "superseded_by", "reason"}:
+        raise ValueError("Lifecycle approval has no exact state-registry entry")
+    if state.get("status") not in {"active", "revoked", "superseded"}:
+        raise ValueError("Lifecycle approval state is unsupported")
+    if state.get("status") != "active":
+        raise ValueError(f"Lifecycle approval is {state.get('status')}")
+    return {
+        "approval": approval,
+        "approval_path": path,
+        "state_registry": state_registry,
+        "state_registry_path": state_path,
+        "state_registry_sha256": hashlib.sha256(state_payload).hexdigest(),
+    }
 
 
 def verify_runtime_matches_approved_commit(root: str | Path, code_commit: str) -> None:
@@ -190,6 +245,25 @@ def verify_runtime_matches_approved_commit(root: str | Path, code_commit: str) -
     )
     if result.returncode != 0:
         raise ValueError("Runtime code/config differs from the approved lifecycle commit")
+    untracked = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "src",
+            "scripts",
+            "config",
+            "pyproject.toml",
+        ],
+        cwd=Path(root),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if any(line.startswith("?? ") for line in untracked.splitlines()):
+        raise ValueError("Runtime code/config contains unapproved untracked files")
 
 
 def _verify_catalog_evidence_consistency(
@@ -213,16 +287,18 @@ def _verify_catalog_evidence_consistency(
             (item.get("contract_identity"), item.get("dimension")), []
         ).append(item)
     accepted_announcements = [
-        item for item in announcements if item.get("match_status") == "accepted"
+        item
+        for item in announcements
+        if item.get("match_status")
+        in {"accepted", "ambiguous_multiple_applicable_articles"}
     ]
     candidates = sorted(set(archive_by_symbol) | set(noncanonical_candidates))
-    scope_by_identity = verify_scope_registry(scope_registry, candidates)
+    scope_by_identity = verify_scope_registry(
+        scope_registry, candidates, require_independent_review=False
+    )
     trade_by_symbol = {row.get("symbol"): row for row in first_trades}
     if len(trade_by_symbol) != len(first_trades):
         raise ValueError("First-observed-trade evidence contains duplicate identities")
-    if first_trades:
-        with ProcessPoolExecutor(max_workers=min(8, len(first_trades))) as executor:
-            list(executor.map(verify_first_observed_trade_record, first_trades))
     delisting_catalogs = [
         item
         for item in announcement_audit.get("catalogs", [])
@@ -338,6 +414,11 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         "historical_scope_registry.json",
         "first_observed_trades.json",
         "announcement_corpus_audit.json",
+        "candidate_inventory.json",
+        "lifecycle_adjudications.json",
+        "lifecycle_daily_trade_boundaries.json",
+        "primitive_evidence_manifest.json",
+        "full_evidence_verification_report.json",
     }
     artifacts = bundle.get("artifacts")
     if type(artifacts) is not dict or set(artifacts) != required:
@@ -383,6 +464,56 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         noncanonical.get("prefixes")
     ) is not list:
         raise ValueError("Noncanonical archive queue is malformed")
+    candidates = sorted(
+        {row.get("symbol") for row in archive_rows} | set(noncanonical["prefixes"])
+    )
+    verify_scope_registry(
+        scope_registry,
+        candidates,
+        registry_path=resolved["historical_scope_registry.json"],
+        repository_root=config_path.parent.parent,
+    )
+    inventory = json.loads(resolved["candidate_inventory.json"].read_text("utf-8"))
+    primitive = json.loads(
+        resolved["primitive_evidence_manifest.json"].read_text("utf-8")
+    )
+    replay = json.loads(
+        resolved["full_evidence_verification_report.json"].read_text("utf-8")
+    )
+    adjudications = json.loads(resolved["lifecycle_adjudications.json"].read_text("utf-8"))
+    primitive_core = {key: value for key, value in primitive.items() if key != "manifest_id"}
+    replay_core = {
+        key: value for key, value in replay.items() if key != "verification_report_id"
+    }
+    adjudication_core = {
+        key: value for key, value in adjudications.items() if key != "adjudication_id"
+    }
+    chain = bundle.get("authorization_chain")
+    expected_chain = {
+        "primitive_evidence_manifest_id": primitive.get("manifest_id"),
+        "primitive_evidence_manifest_sha256": artifacts[
+            "primitive_evidence_manifest.json"
+        ]["sha256"],
+        "full_evidence_verification_report_id": replay.get("verification_report_id"),
+        "full_evidence_verification_report_sha256": artifacts[
+            "full_evidence_verification_report.json"
+        ]["sha256"],
+        "reviewed_scope_registry_id": scope_registry.get("registry_id"),
+        "reviewed_scope_registry_sha256": artifacts[
+            "historical_scope_registry.json"
+        ]["sha256"],
+        "scope_independent_review": scope_registry.get("independent_review"),
+        "lifecycle_adjudication_id": adjudications.get("adjudication_id"),
+    }
+    if (
+        primitive.get("manifest_id") != content_identity(primitive_core)
+        or replay.get("verification_report_id") != content_identity(replay_core)
+        or replay.get("status") != "PASS"
+        or adjudications.get("adjudication_id") != content_identity(adjudication_core)
+        or inventory.get("candidate_set_digest") != scope_registry.get("candidate_set_digest")
+        or chain != expected_chain
+    ):
+        raise ValueError("Lifecycle authorization chain is invalid")
     _verify_catalog_evidence_consistency(
         catalog,
         classification,
@@ -448,6 +579,12 @@ def verify_bound_plan(plan_path: str | Path) -> dict[str, Any]:
     verified_approval = verify_approval_pin(approval_path, verified)
     if plan.get("lifecycle_approval_id") != verified_approval["approval"]["approval_id"]:
         raise ValueError("Download plan references the wrong lifecycle approval")
+    if plan.get("approval_state_registry") != {
+        "path": str(verified_approval["state_registry_path"].resolve()),
+        "sha256": verified_approval["state_registry_sha256"],
+        "registry_id": verified_approval["state_registry"]["registry_id"],
+    }:
+        raise ValueError("Download plan approval state is stale or changed")
     if plan.get("config_sha256") != bundle["config"]["sha256"]:
         raise ValueError("Download plan references the wrong config digest")
     if plan.get("artifact_hashes") != {

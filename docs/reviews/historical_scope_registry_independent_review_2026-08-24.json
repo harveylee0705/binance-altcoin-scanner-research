@@ -1,0 +1,29 @@
+{
+  "candidate_count": 986,
+  "candidate_set_digest": "b323b3c3ba1010654d9ce1a47325364f7c7e624624857554b7e945f38f91c445",
+  "checks": {
+    "archive_only_classifications": "PASS",
+    "candidate_inventory_reconstructed_from_raw_xml": "PASS",
+    "current_exchange_info_metadata": "PASS",
+    "direct_positive_exclusion_evidence": "PASS",
+    "leveraged_token_positive_omission_search": "PASS",
+    "noncrypto_index_composite_exclusions": "PASS",
+    "stablecoin_positive_omission_search": "PASS",
+    "unicode_identities": "PASS"
+  },
+  "exchange_info_sha256": "04b6c96c08d18c72a555879997d9e5bc14226eb5d40b168536b07b709cca5f6b",
+  "findings": [],
+  "leveraged_token_positive_exclusions": [],
+  "review_id": "b230224b7b09a55dba01f23fdde9df15e3586d744eb702597bcafa299d2e91d3",
+  "reviewed_at": "2026-08-24T00:00:00+07:00",
+  "reviewer": "milestone-reviewer-read-only",
+  "schema_version": "historical-scope-independent-review-v1",
+  "scope_registry_payload_id": "fd5682792ec1a7a863e5f0b524f8197728a0c3c81f08cb0b90e2ee6130e6d775",
+  "stablecoin_positive_exclusions": [
+    "FRAXUSDT",
+    "USDCUSDT",
+    "USTCUSDT"
+  ],
+  "usdt_candidate_count": 832,
+  "verdict": "PASS"
+}

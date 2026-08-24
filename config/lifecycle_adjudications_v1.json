@@ -1,0 +1,253 @@
+{
+  "adjudication_id": "6695915ebb7df0f1baaa78dafa1a5fec64a63757aa19e512ba94c869c05280eb",
+  "candidate_set_digest": "b323b3c3ba1010654d9ce1a47325364f7c7e624624857554b7e945f38f91c445",
+  "records": [
+    {
+      "episodes": [
+        {
+          "anchor_basis": "exact_official_original_launch",
+          "episode_id": "AERGOUSDT:1",
+          "listing_article_id": "de870af81e8d42cd903b84a97fa5bc91",
+          "terminated_at": "2025-03-28T00:00:00+00:00",
+          "termination_basis": "complete_daily_trade_index_gap_after_2025-03-27"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "delisting_article_id": "f0e3fc835b9545759e4279c64b200389",
+          "episode_id": "AERGOUSDT:2",
+          "listing_article_id": "82f730b7ef444a38b323ab7a2e56b757",
+          "termination_basis": "official_delisting_event"
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2025-04-16",
+        "last_pre_gap_trade_archive_date": "2025-03-27"
+      },
+      "symbol": "AERGOUSDT",
+      "summary": "Two official Futures launches plus a complete daily-trade archive gap establish a genuine termination and relisting; the spot delisting article is not Futures evidence."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "first_observed_binance_futures_trade",
+          "delisting_article_id": "20eee4109e06448992f0557bf798bb36",
+          "episode_id": "AIAUSDT:1",
+          "termination_basis": "official_delisting_event"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "episode_id": "AIAUSDT:2",
+          "listing_article_id": "4e7c59d4078e4babbc191c80fe6698e7",
+          "termination_basis": null
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2026-01-20",
+        "last_pre_gap_trade_archive_date": "2025-12-11"
+      },
+      "rejected_listing_articles": [
+        {
+          "article_id": "31ec31401a8f43ae821f80351fa94857",
+          "reason": "The announced 2026-01-16 launch produced no Binance daily trade archive before the explicit 2026-01-20 relaunch; current exchangeInfo onboardDate and the complete daily index both bind the effective relist to 2026-01-20."
+        }
+      ],
+      "symbol": "AIAUSDT",
+      "summary": "The December termination and January 20 relisting are genuine; the superseded January 16 launch claim is not used as a live boundary."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "exact_official_original_launch",
+          "delisting_article_id": "ce74360a3fd444b2b35da7186f8dd0ad",
+          "episode_id": "CTKUSDT:1",
+          "listing_article_id": "e42cfd99f32a4a9aa3c29c8a31ef4ddc",
+          "termination_basis": "official_delisting_event"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "episode_id": "CTKUSDT:2",
+          "listing_article_id": "63155163bce541f5856d416efa71c6e8",
+          "termination_basis": null
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2025-04-30",
+        "last_pre_gap_trade_archive_date": "2024-04-01"
+      },
+      "symbol": "CTKUSDT",
+      "summary": "Official Futures termination and later launch establish a genuine relisting."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "exact_official_original_launch",
+          "delisting_article_id": "3188e26f14a1464b91487abad452c04f",
+          "episode_id": "CVCUSDT:1",
+          "listing_article_id": "a060f642ff8d4f8e8091e34fba220e77",
+          "termination_basis": "official_delisting_event"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "episode_id": "CVCUSDT:2",
+          "listing_article_id": "bbe829426ad844b9b9dac62f878d1e67",
+          "termination_basis": null
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2025-05-16",
+        "last_pre_gap_trade_archive_date": "2022-11-29"
+      },
+      "symbol": "CVCUSDT",
+      "summary": "Official Futures termination and later launch establish a genuine relisting; spot and margin articles are rejected product matches."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "first_observed_binance_futures_trade",
+          "delisting_article_id": "a58cc13f78a34fbba11f00ff7144e9ee",
+          "episode_id": "CVXUSDT:1",
+          "terminated_at": "2024-05-14T09:00:00+00:00",
+          "termination_basis": "official_delisting_event"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "episode_id": "CVXUSDT:2",
+          "listing_article_id": "b7b3a116013145569a9850f197c8cbe4",
+          "termination_basis": null
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2025-07-23",
+        "last_pre_gap_trade_archive_date": "2024-05-14"
+      },
+      "symbol": "CVXUSDT",
+      "summary": "Official Futures termination, daily archive gap, and later launch establish a genuine relisting."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "first_observed_binance_futures_trade",
+          "delisting_article_id": "af469aeeab074738bb4a276070a9d11b",
+          "episode_id": "ICPUSDT:1",
+          "terminated_at": "2022-06-10T09:00:00+00:00",
+          "termination_basis": "official_delisting_event"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "episode_id": "ICPUSDT:2",
+          "listing_article_id": "adabdfbc53344094808a7bea464f101b",
+          "termination_basis": null
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2022-09-27",
+        "last_pre_gap_trade_archive_date": "2022-06-10"
+      },
+      "symbol": "ICPUSDT",
+      "summary": "The official relaunch notice identifies the prior ICPUSDT contract as delisted on 2022-06-10, and the complete daily-trade index has no intervening trade archive before the 2022-09-27 relaunch."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "first_observed_binance_futures_trade",
+          "episode_id": "KNCUSDT:1",
+          "termination_basis": null
+        }
+      ],
+      "rejected_listing_articles": [
+        {
+          "article_id": "a6f4712fbf404bc995768730b7438646",
+          "reason": "The article's scheduled 09:00 UTC launch is six minutes after checksum-verified Futures trading began and therefore cannot be the exact actual live boundary."
+        }
+      ],
+      "symbol": "KNCUSDT",
+      "summary": "Demote the contradicted scheduled launch time and retain the earlier verified first Futures trade as the conservative age anchor."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "exact_official_original_launch",
+          "delisting_article_id": "27eac260521b4f40ab331e1a345887a7",
+          "episode_id": "MAVIAUSDT:1",
+          "listing_article_id": "521a6a71b21046f2b07b021edfd41b9f",
+          "termination_basis": "official_delisting_event"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "episode_id": "MAVIAUSDT:2",
+          "listing_article_id": "815acb27cc2146d2b3f2a4fe933f11d9",
+          "termination_basis": null
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2025-03-26",
+        "last_pre_gap_trade_archive_date": "2024-12-16"
+      },
+      "symbol": "MAVIAUSDT",
+      "summary": "Official Futures termination and later launch establish a genuine relisting."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "exact_official_original_launch",
+          "delisting_amendment_article_ids": [
+            "eedac7aff5b849d58efda6c4b3cec01b",
+            "1e43c128806544018d3cc537a8add3f6"
+          ],
+          "delisting_article_id": "27eac260521b4f40ab331e1a345887a7",
+          "episode_id": "OMGUSDT:1",
+          "listing_article_id": "c7ff131cce8e432087756a0370d082e8",
+          "termination_basis": "exchange_info_delivery_and_complete_daily_trade_index",
+          "terminated_at": "2025-01-31T09:00:00+00:00"
+        }
+      ],
+      "gap_evidence": {
+        "last_terminal_trade_archive_date": "2025-01-31"
+      },
+      "symbol": "OMGUSDT",
+      "summary": "The Futures delisting was postponed twice but ultimately terminated without relisting; the earliest exact Futures delisting publication remains the conservative signal cutoff."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "exact_official_original_launch",
+          "delisting_article_id": "cb525a5fbb954935afc77630fc5bd0cc",
+          "episode_id": "SLPUSDT:1",
+          "listing_article_id": "5d8c7476197344d087b5af436bfc74ae",
+          "terminated_at": "2024-05-15T09:00:00+00:00",
+          "termination_basis": "official_delisting_event"
+        },
+        {
+          "anchor_basis": "exact_official_relisting_launch",
+          "episode_id": "SLPUSDT:2",
+          "listing_article_id": "b7b3a116013145569a9850f197c8cbe4",
+          "termination_basis": null
+        }
+      ],
+      "gap_evidence": {
+        "first_post_gap_trade_archive_date": "2025-07-23",
+        "last_pre_gap_trade_archive_date": "2024-05-15"
+      },
+      "symbol": "SLPUSDT",
+      "summary": "Official Futures termination, daily archive gap, and later launch establish a genuine relisting."
+    },
+    {
+      "episodes": [
+        {
+          "anchor_basis": "first_observed_binance_futures_trade",
+          "delisting_article_id": "cfe97d52a8c840d3ba631835b637e9e7",
+          "episode_id": "XEMUSDT:1",
+          "termination_basis": "official_delisting_event"
+        }
+      ],
+      "gap_evidence": {
+        "last_terminal_trade_archive_date": "2024-12-09"
+      },
+      "symbol": "XEMUSDT",
+      "summary": "The Futures contract genuinely terminated without relisting; the earlier spot delisting article is rejected as another product."
+    }
+  ],
+  "review_version": "lifecycle-conflict-adjudication-v1",
+  "reviewed_at": "2026-08-24T00:00:00+07:00",
+  "schema_version": "lifecycle-adjudications-v1"
+}

@@ -27,6 +27,11 @@ logical fields below. Nullable means “unknown/not computable,” never silentl
 | `first_valid_kline_at`, `last_valid_kline_at` | timestamp? | Independently established valid-kline boundaries only |
 | `delisting_announcement_published_at` | timestamp? | Official announcement publication time only; frozen no-new-event cutoff |
 | `official_last_trading_at` | timestamp? | Exact stated last-trading/settlement time, kept separate from publication |
+| `eligibility_age_anchor_at` | timestamp? | Conservative live boundary for the first/only episode; interval selection overrides it per signal |
+| `eligibility_age_anchor_basis` | string | Exact original launch, exact relisting launch, verified first trade, legacy adjudication, or unresolved |
+| `lifecycle_episode_count` | int | Number of reviewed non-overlapping lifecycle intervals |
+| `lifecycle_intervals` | list[object] | Episode ID, live/age anchor, basis, listing evidence, publication cutoff, last-trading evidence, termination basis, status, and conflicts |
+| `lifecycle_adjudication_id` | string? | Content identity of the reviewed conflict-adjudication input |
 | `exchange_info_delivery_at` | timestamp? | Current API delivery field; active sentinels are preserved, not promoted |
 | `latest_known_status` | string | Status observed at metadata acquisition, never historical membership |
 | `metadata_acquired_at` | timestamp | When metadata response was captured |
@@ -63,7 +68,8 @@ open/close/low, volumes and trade count must be nonnegative, and timestamps must
 | `continuity_segment` | Increments after a missing 4H boundary; rolling features never cross it |
 | OHLC/volumes/trades | First/max/min/last/sum aggregation |
 | `is_eligible` | Point-in-time universe and 30-day-age result |
-| `contract_age_days` | Calendar elapsed time since exact official Futures trading start |
+| `contract_age_days` | Calendar elapsed time since the selected episode's conservative live boundary |
+| `selected_lifecycle_episode_id` | Active lifecycle episode at the signal timestamp; null before/after intervals and in gaps |
 | `return_1d`, `return_3d`, `return_7d` | 6/18/42-bar close returns |
 | `rs_1d_pct`, `rs_3d_pct`, `rs_7d_pct` | Eligible-universe timestamp ranks |
 | `vol_exp_4h_raw`, `vol_exp_4h_pct` | Current 4H volume / prior-30 median and rank |

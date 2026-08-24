@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from alt_hot_scanner.data.acquisition import require_complete_attempt_manifest
 from alt_hot_scanner.data.aggregate import aggregate_1h_to_4h
 from alt_hot_scanner.data.binance_public import (
     collision_resistant_run_id,
@@ -29,9 +30,14 @@ def main() -> None:
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
     raw_root = root / "data" / "raw"
-    attempts = json.loads((root / args.attempt_manifest).read_text(encoding="utf-8"))
+    manifest = json.loads((root / args.attempt_manifest).read_text(encoding="utf-8"))
+    if type(manifest) is not dict or manifest.get("schema_version") != "plan-bound-attempt-manifest-v1":
+        raise ValueError("Canonical processing requires a plan-bound attempt manifest")
+    attempts = manifest.get("attempts")
     if type(attempts) is not list or any(type(item) is not dict for item in attempts):
-        raise ValueError("Attempt manifest must be a list of objects")
+        raise ValueError("Attempt manifest attempts must be a list of objects")
+    plan = {"planning_basis": "exact_observed_source_plan", "objects": manifest.get("planned_objects", [])}
+    require_complete_attempt_manifest(plan, attempts, canonical=manifest.get("canonical") is True)
     allowed_statuses = {"verified", "missing", "failed"}
     if any(item.get("status") not in allowed_statuses for item in attempts):
         raise ValueError("Attempt manifest contains an invalid status")

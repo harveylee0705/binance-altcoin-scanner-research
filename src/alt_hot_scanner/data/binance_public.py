@@ -35,10 +35,10 @@ ARCHIVE_HOST = "https://data.binance.vision"
 INDEX_HOST = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ARCHIVE_KEY = re.compile(
-    r"data/futures/um/monthly/klines/"
+    r"data/futures/um/(?P<source_kind>monthly|daily)/klines/"
     r"(?P<symbol>[^/\\]{1,128})/"
     r"(?P<interval>1h)/"
-    r"(?P=symbol)-(?P=interval)-(?P<period>20[0-9]{2}-(?:0[1-9]|1[0-2]))\.zip"
+    r"(?P=symbol)-(?P=interval)-(?P<period>20[0-9]{2}-(?:0[1-9]|1[0-2])(?:-(?:0[1-9]|[12][0-9]|3[01]))?)\.zip"
 )
 _DAILY_TRADE_KEY = re.compile(
     r"data/futures/um/daily/trades/"
@@ -54,6 +54,7 @@ class ArchiveObjectIdentity:
     interval: str
     period: str
     filename: str
+    source_kind: str = "monthly"
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,17 @@ def validate_archive_object_key(object_key: object) -> ArchiveObjectIdentity:
     match = _ARCHIVE_KEY.fullmatch(key)
     if match is None:
         raise ValueError("object_key is outside the Binance USD-M monthly 1H kline hierarchy")
+    if match.group("source_kind") == "daily" and len(match.group("period")) != 10:
+        raise ValueError("Daily kline object keys require a YYYY-MM-DD period")
+    if match.group("source_kind") == "monthly" and len(match.group("period")) != 7:
+        raise ValueError("Monthly kline object keys require a YYYY-MM period")
+    try:
+        datetime.strptime(
+            match.group("period"),
+            "%Y-%m-%d" if len(match.group("period")) == 10 else "%Y-%m",
+        ).replace(tzinfo=UTC)
+    except ValueError as exc:
+        raise ValueError("Object-key period is not a real calendar date") from exc
     symbol = require_archive_symbol_identity(match.group("symbol"), "object_key symbol")
     return ArchiveObjectIdentity(
         object_key=key,
@@ -185,6 +197,7 @@ def validate_archive_object_key(object_key: object) -> ArchiveObjectIdentity:
         interval=match.group("interval"),
         period=match.group("period"),
         filename=key.rsplit("/", 1)[-1],
+        source_kind=match.group("source_kind"),
     )
 
 
@@ -703,10 +716,9 @@ def list_archive_index(
     if unicodedata.normalize("NFC", prefix) != prefix:
         raise ValueError("archive index prefix must use canonical Unicode encoding")
     canonical_prefix = prefix
-    allowed_prefix = canonical_prefix.startswith("data/futures/um/monthly/klines/") or (
-        canonical_prefix.startswith("data/futures/um/daily/trades/")
-        and "\\" not in canonical_prefix
-    )
+    allowed_prefix = canonical_prefix.startswith(
+        ("data/futures/um/monthly/klines/", "data/futures/um/daily/klines/", "data/futures/um/daily/trades/")
+    ) and (not canonical_prefix.startswith("data/futures/um/daily/trades/") or "\\" not in canonical_prefix)
     if not allowed_prefix or "\\" in canonical_prefix:
         raise ValueError("Archive index prefix is outside an approved Binance USD-M hierarchy")
     if delimiter not in {None, "/"}:

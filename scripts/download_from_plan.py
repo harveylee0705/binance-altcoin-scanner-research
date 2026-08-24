@@ -136,7 +136,17 @@ def main() -> None:
     run_id = collision_resistant_run_id()
     manifest_path = raw_root / "manifests" / f"full_download_attempts_{run_id}.json"
     attempts.sort(key=lambda item: item["object_key"])
-    write_json_exclusive(manifest_path, attempts)
+    write_json_exclusive(
+        manifest_path,
+        {
+            "schema_version": "plan-bound-attempt-manifest-v1",
+            "plan_path": str(plan_path.resolve()),
+            "plan_integrity": plan.get("plan_integrity"),
+            "planned_objects": list(plan["objects"]),
+            "canonical": args.limit is None,
+            "attempts": attempts,
+        },
+    )
     verified = sum(attempt["status"] == "verified" for attempt in attempts)
     missing = sum(attempt["status"] == "missing" for attempt in attempts)
     failures = sum(attempt["status"] == "failed" for attempt in attempts)

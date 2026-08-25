@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import subprocess
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from itertools import pairwise
@@ -181,6 +183,43 @@ def _active_catalog(symbol: str = "ETHUSDT") -> pd.DataFrame:
     }])
 
 
+def test_missing_whole_leading_active_month_is_fatal_before_api_planning() -> None:
+    feb = MONTH.replace("2024-01", "2024-02")
+    mar = MONTH.replace("2024-01", "2024-03")
+    with pytest.raises(
+        AcquisitionInvariantError,
+        match=r"Missing lifecycle-active monthly archive for ETHUSDT at 2024-01; API repair prohibited",
+    ):
+        build_mixed_source_inventory(
+            monthly_keys=[feb, mar],
+            daily_identities=[],
+            approved_symbols={"ETHUSDT"},
+            frozen_candidate_universe={"ETHUSDT"},
+            warmup_start_month="2024-01",
+            cutoff_exclusive_utc="2024-04-01T00:00:00Z",
+            daily_discovery_evidence=[],
+            lifecycle_catalog=_active_catalog(),
+        )
+
+
+def test_missing_whole_trailing_active_month_is_fatal_before_api_planning() -> None:
+    feb = MONTH.replace("2024-01", "2024-02")
+    with pytest.raises(
+        AcquisitionInvariantError,
+        match=r"Missing lifecycle-active monthly archive for ETHUSDT at 2024-03; API repair prohibited",
+    ):
+        build_mixed_source_inventory(
+            monthly_keys=[MONTH, feb],
+            daily_identities=[],
+            approved_symbols={"ETHUSDT"},
+            frozen_candidate_universe={"ETHUSDT"},
+            warmup_start_month="2024-01",
+            cutoff_exclusive_utc="2024-04-01T00:00:00Z",
+            daily_discovery_evidence=[],
+            lifecycle_catalog=_active_catalog(),
+        )
+
+
 def test_daily_unknown_lifecycle_identity_halts_and_interior_gap_cannot_be_api_repaired() -> None:
     daily = [validate_daily_kline_object_key(DAILY)]
     with pytest.raises(AcquisitionInvariantError, match="absent frozen lifecycle"):
@@ -203,7 +242,7 @@ def test_daily_unknown_lifecycle_identity_halts_and_interior_gap_cannot_be_api_r
             daily_identities=[d1, d3],
             approved_symbols={"ETHUSDT"},
             frozen_candidate_universe={"ETHUSDT"},
-            warmup_start_month="2023-12",
+            warmup_start_month="2024-01",
             cutoff_exclusive_utc="2024-02-05T12:00:00Z",
             daily_discovery_evidence=[{"sha256": "b" * 64}],
             lifecycle_catalog=_active_catalog(),
@@ -457,6 +496,162 @@ def test_lifecycle_boundary_and_separate_acquisition_authorization(tmp_path: Pat
         verify_acquisition_authorization(auth_path, repo)
 
 
+def _monthly_zip_bytes(symbol: str, period: str) -> bytes:
+    month = pd.Period(period, freq="M")
+    start = month.start_time.tz_localize("UTC")
+    end = (month + 1).start_time.tz_localize("UTC")
+    rows: list[str] = []
+    for opened in pd.date_range(start, end - pd.Timedelta(hours=1), freq="h"):
+        opened_ms = int(opened.timestamp() * 1000)
+        close_ms = int(
+            (opened + pd.Timedelta(hours=1) - pd.Timedelta(milliseconds=1)).timestamp() * 1000
+        )
+        rows.append(
+            ",".join(
+                str(value)
+                for value in (
+                    opened_ms,
+                    100.0,
+                    101.0,
+                    99.0,
+                    100.5,
+                    10.0,
+                    close_ms,
+                    1005.0,
+                    10,
+                    5.0,
+                    502.5,
+                    0,
+                )
+            )
+        )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{symbol}-1h-{period}.csv", "\n".join(rows).encode("utf-8"))
+    return buffer.getvalue()
+
+
+def _monthly_gap_verified_plan(
+    tmp_path: Path, *, observed_period: str, cutoff: str
+) -> tuple[dict, Path, Path]:
+    symbol = "ETHUSDT"
+    month = pd.Period(observed_period, freq="M")
+    source_start = month.start_time.tz_localize("UTC")
+    source_end = (month + 1).start_time.tz_localize("UTC")
+    object_key = (
+        f"data/futures/um/monthly/klines/{symbol}/1h/"
+        f"{symbol}-1h-{observed_period}.zip"
+    )
+    entry = SourceEntry(
+        "monthly",
+        symbol,
+        object_key,
+        observed_period,
+        ("synthetic observed monthly object",),
+        (source_start.isoformat(), source_end.isoformat()),
+    )
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    raw = _monthly_zip_bytes(symbol, observed_period)
+    raw_path = raw_root / f"{symbol}-1h-{observed_period}.zip"
+    raw_path.write_bytes(raw)
+    raw_sha = hashlib.sha256(raw).hexdigest()
+    sidecar = raw_root / f"{raw_path.name}.CHECKSUM"
+    sidecar_bytes = f"{raw_sha}  {raw_path.name}\n".encode()
+    sidecar.write_bytes(sidecar_bytes)
+
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+    plan = {
+        "run_identity": {"run_id": "monthly-gap-run", "cutoff_exclusive_utc": cutoff},
+        "plan_integrity": "monthly-gap-plan",
+    }
+    source_root = Path(__file__).resolve().parents[1]
+    catalog = pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "eligibility_age_anchor_at": "2019-12-01T00:00:00Z",
+                "first_observed_trade_at": "2019-12-01T00:00:00Z",
+                "last_trading_at": None,
+                "lifecycle_intervals": "[]",
+            }
+        ]
+    )
+    verified = {
+        "plan": plan,
+        "plan_path": plan_path.resolve(),
+        "source_entries": [entry],
+        "verified_bundle": {
+            "catalog": catalog,
+            "config_path": (source_root / "config/research_v0_1.yaml").resolve(),
+        },
+    }
+    attempt = {
+        "source_kind": "monthly",
+        "symbol": symbol,
+        "object_key_or_request": object_key,
+        "status": "verified",
+        "raw_path": str(raw_path.resolve()),
+        "raw_sha256": raw_sha,
+        "byte_count": len(raw),
+        "retrieved_at": "2026-08-25T00:00:00Z",
+        "published_sha256": raw_sha,
+        "checksum_sidecar_path": str(sidecar.resolve()),
+        "checksum_sidecar_sha256": hashlib.sha256(sidecar_bytes).hexdigest(),
+        "payload_source": "synthetic_checksum_verified_archive",
+        "upstream_revision_detected": False,
+        "error": None,
+    }
+    attempt_core = {
+        "schema_version": ATTEMPT_SCHEMA_VERSION,
+        "plan_path": str(plan_path.resolve()),
+        "plan_integrity": "monthly-gap-plan",
+        "run_id": "monthly-gap-run",
+        "canonical": True,
+        "attempts": [attempt],
+    }
+    attempt_payload = {**attempt_core, "attempt_id": digest_json(attempt_core)}
+    attempt_path = raw_root / "attempt.json"
+    attempt_path.write_text(json.dumps(attempt_payload), encoding="utf-8")
+    completion = build_raw_completion_manifest(verified, attempt_path, raw_root)
+    completion_path = raw_root / "completion.json"
+    completion_path.write_text(json.dumps(completion), encoding="utf-8")
+    return verified, raw_root, completion_path
+
+
+def test_gate_b_rejects_whole_leading_lifecycle_active_month(tmp_path: Path) -> None:
+    verified, raw_root, completion = _monthly_gap_verified_plan(
+        tmp_path, observed_period="2020-01", cutoff="2020-02-01T00:00:00Z"
+    )
+    gate_a_path = tmp_path / "A.json"
+    write_gate(gate_a_path, derive_gate_a(verified, completion, raw_root))
+    with pytest.raises(AcquisitionInvariantError, match="leading_active_gap"):
+        build_normalized_1h_stage(
+            verified_plan=verified,
+            completion_path=completion,
+            raw_root=raw_root,
+            gate_a_path=gate_a_path,
+            target=tmp_path / "normalized",
+        )
+
+
+def test_gate_b_rejects_whole_trailing_lifecycle_active_month(tmp_path: Path) -> None:
+    verified, raw_root, completion = _monthly_gap_verified_plan(
+        tmp_path, observed_period="2019-12", cutoff="2020-02-01T00:00:00Z"
+    )
+    gate_a_path = tmp_path / "A.json"
+    write_gate(gate_a_path, derive_gate_a(verified, completion, raw_root))
+    with pytest.raises(AcquisitionInvariantError, match="trailing_active_gap"):
+        build_normalized_1h_stage(
+            verified_plan=verified,
+            completion_path=completion,
+            raw_root=raw_root,
+            gate_a_path=gate_a_path,
+            target=tmp_path / "normalized",
+        )
+
+
 def _api_rows(start: pd.Timestamp, hours: int, drift: float) -> bytes:
     rows = []
     for index in range(hours):
@@ -472,7 +667,7 @@ def _api_rows(start: pd.Timestamp, hours: int, drift: float) -> bytes:
 
 def _synthetic_verified_plan(tmp_path: Path) -> tuple[dict, Path, Path]:
     source_root = Path(__file__).resolve().parents[1]
-    start = pd.Timestamp("2019-12-20T00:00:00Z")
+    start = pd.Timestamp("2019-12-01T00:00:00Z")
     hours = 1000
     cutoff = start + pd.Timedelta(hours=hours)
     raw_root = tmp_path / "raw"

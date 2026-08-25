@@ -235,25 +235,36 @@ def _catalog_active_intervals(
     return clipped
 
 
+def _required_acquisition_window(verified_plan: dict[str, Any]) -> tuple[pd.Timestamp, pd.Timestamp]:
+    config = load_config(verified_plan["verified_bundle"]["config_path"])
+    research_start = pd.Timestamp(config["data"]["start"])
+    if research_start.tzinfo is None:
+        research_start = research_start.tz_localize("UTC")
+    else:
+        research_start = research_start.tz_convert("UTC")
+    warmup_month = research_start.tz_localize(None).to_period("M") - 1
+    required_start = warmup_month.start_time.tz_localize("UTC")
+    cutoff = pd.Timestamp(verified_plan["plan"]["run_identity"]["cutoff_exclusive_utc"])
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.tz_localize("UTC")
+    else:
+        cutoff = cutoff.tz_convert("UTC")
+    if required_start >= cutoff:
+        raise AcquisitionInvariantError("Required acquisition window is empty or reversed")
+    return required_start, cutoff
+
+
 def _active_gap_records(
     frame: pd.DataFrame,
     catalog: pd.DataFrame,
-    entries: list[SourceEntry],
+    expected_symbols: set[str],
+    required_start: pd.Timestamp,
     cutoff: pd.Timestamp,
 ) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
     records: list[dict[str, Any]] = []
     boundary_map: dict[str, list[str]] = {}
-    for symbol in sorted({entry.symbol for entry in entries}):
-        ranges = [
-            (pd.Timestamp(entry.selected_canonical_range[0]), pd.Timestamp(entry.selected_canonical_range[1]))
-            for entry in entries
-            if entry.symbol == symbol
-        ]
-        if not ranges:
-            continue
-        clip_start = min(start for start, _ in ranges)
-        clip_end = min(cutoff, max(end for _, end in ranges))
-        active = _catalog_active_intervals(catalog, symbol, clip_start, clip_end)
+    for symbol in sorted(expected_symbols):
+        active = _catalog_active_intervals(catalog, symbol, required_start, cutoff)
         symbol_times = frame.loc[frame["symbol"].eq(symbol), "open_time"]
         boundary_map[symbol] = sorted({point.isoformat() for pair in active for point in pair})
         for start, end in active:
@@ -300,6 +311,14 @@ def _active_gap_records(
     return records, boundary_map
 
 
+def _expected_source_symbols(verified_plan: dict[str, Any]) -> set[str]:
+    approved = verified_plan.get("approved_symbols")
+    if approved is not None:
+        return set(approved)
+    # Synthetic/bounded integration fixtures predate the verifier return-field addition.
+    return {entry.symbol for entry in verified_plan["source_entries"]}
+
+
 def _rebuild_normalized_frame(
     verified_plan: dict[str, Any], completion_path: str | Path, raw_root: str | Path
 ) -> tuple[dict[str, Any], pd.DataFrame, list[dict[str, Any]], dict[str, list[str]]]:
@@ -337,8 +356,10 @@ def _rebuild_normalized_frame(
     unknown = sorted(set(hourly["symbol"]) - set(catalog["symbol"]))
     if unknown:
         raise AcquisitionInvariantError(f"Canonical 1H contains unknown lifecycle identities: {unknown}")
-    cutoff = pd.Timestamp(verified_plan["plan"]["run_identity"]["cutoff_exclusive_utc"])
-    gaps, boundaries = _active_gap_records(hourly, catalog, verified_plan["source_entries"], cutoff)
+    required_start, cutoff = _required_acquisition_window(verified_plan)
+    gaps, boundaries = _active_gap_records(
+        hourly, catalog, _expected_source_symbols(verified_plan), required_start, cutoff
+    )
     if gaps:
         raise AcquisitionInvariantError(f"Unresolved active-source gaps block Gate B: {gaps[:5]}")
     return completion, hourly, gaps, boundaries
@@ -359,6 +380,7 @@ def build_normalized_1h_stage(
     completion, hourly, gaps, boundaries = _rebuild_normalized_frame(
         verified_plan, completion_path, raw_root
     )
+    required_start, cutoff = _required_acquisition_window(verified_plan)
 
     output: dict[str, Any] = {}
 
@@ -375,6 +397,10 @@ def build_normalized_1h_stage(
                     "data": data,
                     "active_gap_records": gaps,
                     "lifecycle_boundaries": boundaries,
+                    "required_acquisition_window": [
+                        required_start.isoformat(),
+                        cutoff.isoformat(),
+                    ],
                 },
             )
         )
@@ -420,11 +446,16 @@ def derive_gate_b(
             end = pd.Timestamp(entry.selected_canonical_range[1])
             if group["open_time"].min() < start or group["open_time"].max() >= end:
                 raise AcquisitionInvariantError("Normalized API lineage spills outside plan")
+    required_start, cutoff = _required_acquisition_window(verified_plan)
+    expected_window = [required_start.isoformat(), cutoff.isoformat()]
+    if manifest.get("required_acquisition_window") != expected_window:
+        raise AcquisitionInvariantError("Normalized stage required acquisition window changed")
     gaps, boundaries = _active_gap_records(
         frame,
         verified_plan["verified_bundle"]["catalog"],
-        verified_plan["source_entries"],
-        pd.Timestamp(verified_plan["plan"]["run_identity"]["cutoff_exclusive_utc"]),
+        _expected_source_symbols(verified_plan),
+        required_start,
+        cutoff,
     )
     if gaps or replay_gaps or boundaries != replay_boundaries or boundaries != manifest["lifecycle_boundaries"]:
         raise AcquisitionInvariantError("Normalized stage gap/boundary evidence is not re-derived")

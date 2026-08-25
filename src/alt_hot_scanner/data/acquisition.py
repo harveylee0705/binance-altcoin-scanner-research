@@ -804,6 +804,27 @@ def build_mixed_source_inventory(
         _, end = source_period_bounds("monthly", identity.period)
         if warmup_month <= month and end <= boundary:
             monthly_by_symbol.setdefault(identity.symbol, []).append(identity)
+
+    # Exact observed objects are necessary but not sufficient: a whole monthly object can be
+    # absent from the observed set.  Reconcile the observed monthly tier against the frozen
+    # lifecycle-active history inside the required acquisition window before any daily/API tail
+    # is considered.  A missing historical month is an archive gap, never an API repair request.
+    final_month = boundary.tz_localize(None).to_period("M") - 1
+    required_months = pd.period_range(warmup_month, final_month, freq="M")
+    for symbol in sorted(approved_symbols):
+        observed_periods = {identity.period for identity in monthly_by_symbol.get(symbol, [])}
+        for month in required_months:
+            start = month.start_time.tz_localize("UTC")
+            end = (month + 1).start_time.tz_localize("UTC")
+            if (
+                _lifecycle_source_active_between(lifecycle_catalog, symbol, start, end)
+                and str(month) not in observed_periods
+            ):
+                raise AcquisitionInvariantError(
+                    f"Missing lifecycle-active monthly archive for {symbol} at {month}; "
+                    "API repair prohibited"
+                )
+
     daily_by_symbol: dict[str, dict[pd.Timestamp, AcquisitionArchiveIdentity]] = {}
     for identity in daily_identities:
         if identity.symbol not in approved_symbols:
@@ -988,6 +1009,7 @@ def verify_frozen_plan(plan_path: str | Path, root: str | Path) -> dict[str, Any
         "verified_bundle": verified_bundle,
         "verified_approval": verified_approval,
         "acquisition_authorization": acquisition_auth,
+        "approved_symbols": approved_symbols,
         "source_entries": entries,
     }
 

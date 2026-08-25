@@ -28,7 +28,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = ["src", "."]
 
 [tool.ruff]
 line-length = 100

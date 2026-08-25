@@ -1,30 +1,33 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
 
+from alt_hot_scanner.data.acquisition import (
+    acquisition_executable_tree_sha256,
+    build_mixed_source_inventory,
+    create_frozen_plan,
+    create_run_identity,
+    discover_daily_1h_objects,
+    fetch_frozen_cutoff,
+    verify_acquisition_authorization,
+    verify_lifecycle_runtime_boundary,
+)
 from alt_hot_scanner.data.binance_public import (
     collision_resistant_run_id,
-    validate_archive_object_key,
+    write_bytes_exclusive,
     write_json_exclusive,
 )
-from alt_hot_scanner.universe.authorization import (
-    PLAN_SCHEMA_VERSION,
-    build_plan_integrity,
-    verify_approval_pin,
-    verify_lifecycle_bundle,
-    verify_runtime_matches_approved_commit,
-)
+from alt_hot_scanner.universe.authorization import verify_approval_pin, verify_lifecycle_bundle
 from alt_hot_scanner.universe.contracts import filter_instrument_scope
 from alt_hot_scanner.utils.config import load_config
 
 
 def last_completed_month(now: pd.Timestamp) -> pd.Period:
-    """Return the month before the current UTC calendar month."""
     timestamp = pd.Timestamp(now)
     if timestamp.tzinfo is not None:
         timestamp = timestamp.tz_convert("UTC").tz_localize(None)
@@ -32,109 +35,137 @@ def last_completed_month(now: pd.Timestamp) -> pd.Period:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare, but do not execute, a full archive plan")
-    parser.add_argument("--config", default="config/research_v0_1.yaml")
-    parser.add_argument("--end-month", help="YYYY-MM; default is the current fully ended month")
-    parser.add_argument(
-        "--bundle",
-        required=True,
-        help="Exact content-bound lifecycle bundle; implicit newest-bundle selection is prohibited",
+    parser = argparse.ArgumentParser(
+        description="Prepare one immutable monthly > daily > conditional API source plan; downloads nothing"
     )
-    parser.add_argument("--approval", required=True, help="Exact reviewed lifecycle approval pin")
+    parser.add_argument("--config", default="config/research_v0_1.yaml")
+    parser.add_argument("--bundle", required=True, help="Exact authorized lifecycle bundle")
+    parser.add_argument("--approval", required=True, help="Exact active lifecycle approval pin")
+    parser.add_argument(
+        "--acquisition-authorization",
+        required=True,
+        help="Exact independent PASS authorization for the acquisition/full-build executable",
+    )
     return parser.parse_args()
 
 
-def prepare_plan_payload(
-    bundle_path: Path,
-    approval_path: Path,
-    *,
-    end_month: pd.Period,
-) -> dict:
+def _monthly_keys(verified_bundle: dict, approved_symbols: set[str]) -> list[str]:
+    rows = json.loads(
+        verified_bundle["artifacts"]["archive_observations.json"].read_text(encoding="utf-8")
+    )
+    keys: list[str] = []
+    for row in rows:
+        if row.get("symbol") not in approved_symbols:
+            continue
+        observed = row.get("observed_archive_object_keys")
+        if type(observed) is not list:
+            raise ValueError("Lifecycle archive observations lack exact monthly ZIP keys")
+        keys.extend(observed)
+    return sorted(set(keys))
+
+
+def main() -> None:
+    args = parse_args()
+    root = Path(__file__).resolve().parents[1]
+    bundle_path = Path(args.bundle).resolve()
+    approval_path = Path(args.approval).resolve()
+    acquisition_auth_path = Path(args.acquisition_authorization).resolve()
+
     verified = verify_lifecycle_bundle(bundle_path)
     verified_approval = verify_approval_pin(approval_path, verified)
     if not verified["readiness"]["authorization_ready"]:
-        raise RuntimeError("Lifecycle/integrity gate is incomplete; do not prepare full history")
+        raise RuntimeError("Lifecycle readiness is blocked; acquisition planning prohibited")
+    lifecycle_commit = verified_approval["approval"]["lifecycle_evidence_code_commit"]
+    verify_lifecycle_runtime_boundary(root, lifecycle_commit)
+    acquisition_auth = verify_acquisition_authorization(acquisition_auth_path, root)
+
+    requested_config = (root / args.config).resolve()
+    if requested_config != verified["config_path"]:
+        raise RuntimeError("Requested config is not exact config bound into lifecycle bundle")
     config = load_config(verified["config_path"])
     catalog = verified["catalog"].copy()
     catalog["underlying_subtype"] = catalog["underlying_subtype"].map(
         lambda value: tuple(json.loads(value)) if isinstance(value, str) else value
     )
     scoped = filter_instrument_scope(catalog, config["universe"]["stablecoin_underlyings"])
-    ready = scoped.loc[scoped["historical_inclusion_readiness"].eq("ready")]
-    symbols = set(ready["symbol"])
-    if not symbols:
-        raise RuntimeError("No lifecycle-approved symbols are ready for acquisition planning")
-    archive_rows = json.loads(
-        verified["artifacts"]["archive_observations.json"].read_text(encoding="utf-8")
-    )
-    start_month = pd.Timestamp(config["data"]["start"]).tz_localize(None).to_period("M")
-    warmup_start = start_month - 1
-    objects: list[str] = []
-    for row in archive_rows:
-        if row.get("symbol") not in symbols:
-            continue
-        observed = row.get("observed_archive_object_keys")
-        if type(observed) is not list:
-            raise ValueError("Archive observations lack exact observed ZIP object keys")
-        for key in observed:
-            identity = validate_archive_object_key(key)
-            period = pd.Period(identity.period, freq="M")
-            if warmup_start <= period <= end_month:
-                objects.append(identity.object_key)
-    objects = sorted(set(objects))
-    if not objects:
-        raise RuntimeError("No observed archive ZIP objects satisfy the approved date policy")
-    bundle = verified["bundle"]
-    payload = {
-        "schema_version": PLAN_SCHEMA_VERSION,
-        "created_at": datetime.now(UTC).isoformat(),
-        "purpose": "authorized_full_history_archive_download",
-        "source": config["data"]["archive_index_url"],
-        "lifecycle_bundle": str(Path(bundle_path).resolve()),
-        "lifecycle_bundle_id": bundle["bundle_id"],
-        "lifecycle_approval": str(Path(approval_path).resolve()),
-        "lifecycle_approval_id": verified_approval["approval"]["approval_id"],
-        "approval_state_registry": {
-            "path": str(verified_approval["state_registry_path"].resolve()),
-            "sha256": verified_approval["state_registry_sha256"],
-            "registry_id": verified_approval["state_registry"]["registry_id"],
-        },
-        "artifact_hashes": {
-            name: descriptor["sha256"] for name, descriptor in bundle["artifacts"].items()
-        },
-        "config_sha256": bundle["config"]["sha256"],
-        "readiness": verified["readiness"],
-        "planning_basis": "exact_observed_monthly_zip_objects",
-        "warmup_start_month": str(warmup_start),
-        "end_month": str(end_month),
-        "symbols_discovered": len(symbols),
-        "objects": objects,
-    }
-    payload["plan_integrity"] = build_plan_integrity(payload)
-    return payload
+    approved_symbols = set(scoped.loc[scoped["historical_inclusion_readiness"].eq("ready"), "symbol"])
+    if not approved_symbols:
+        raise RuntimeError("No lifecycle-approved symbols are ready")
 
-
-def main() -> None:
-    args = parse_args()
-    root = Path(__file__).resolve().parents[1]
-    requested_config = (root / args.config).resolve()
-    bundle_path = Path(args.bundle).resolve()
-    approval_path = Path(args.approval).resolve()
-    verified = verify_lifecycle_bundle(bundle_path)
-    verified_approval = verify_approval_pin(approval_path, verified)
-    verify_runtime_matches_approved_commit(
-        root, verified_approval["approval"]["lifecycle_evidence_code_commit"]
+    candidate_inventory = json.loads(
+        verified["artifacts"]["candidate_inventory.json"].read_text(encoding="utf-8")
     )
-    if verified["config_path"] != requested_config:
-        raise RuntimeError("Requested config is not the exact config bound into the lifecycle bundle")
-    now = pd.Timestamp.now(tz="UTC")
-    end = pd.Period(args.end_month, freq="M") if args.end_month else last_completed_month(now)
-    payload = prepare_plan_payload(bundle_path, approval_path, end_month=end)
+    frozen_candidates = set(candidate_inventory.get("candidate_identities", []))
+    if not frozen_candidates:
+        raise RuntimeError("Frozen lifecycle candidate universe is empty")
+
     run_id = collision_resistant_run_id()
-    target = root / "reports" / f"full_download_plan_{run_id}.json"
-    write_json_exclusive(target, payload)
-    print(f"Prepared {len(payload['objects']):,} candidate object keys in {target}")
-    print("No full-history market data was downloaded.")
+    evidence_root = root / "reports" / "source_discovery" / run_id
+    evidence_root.mkdir(parents=True, exist_ok=False)
+
+    cutoff, server_time_raw = fetch_frozen_cutoff()
+    server_time_path = evidence_root / "binance_futures_server_time.json"
+    write_bytes_exclusive(server_time_path, server_time_raw)
+    server_time_sha = hashlib.sha256(server_time_raw).hexdigest()
+
+    daily_pages: list[dict] = []
+
+    def observe(page: int, url: str, payload: bytes) -> None:
+        digest = hashlib.sha256(payload).hexdigest()
+        page_path = evidence_root / f"daily_index_{len(daily_pages) + 1:06d}_{digest}.xml"
+        write_bytes_exclusive(page_path, payload)
+        daily_pages.append(
+            {
+                "sequence": len(daily_pages) + 1,
+                "page": page,
+                "url": url,
+                "sha256": digest,
+                "path": str(page_path.resolve()),
+            }
+        )
+
+    daily, discovery_evidence = discover_daily_1h_objects(page_observer=observe)
+    warmup_start = pd.Timestamp(config["data"]["start"]).tz_localize(None).to_period("M") - 1
+    inventory, boundary = build_mixed_source_inventory(
+        monthly_keys=_monthly_keys(verified, approved_symbols),
+        daily_identities=daily,
+        approved_symbols=approved_symbols,
+        frozen_candidate_universe=frozen_candidates,
+        warmup_start_month=str(warmup_start),
+        cutoff_exclusive_utc=cutoff,
+        daily_discovery_evidence=discovery_evidence,
+        lifecycle_catalog=verified["catalog"],
+    )
+
+    run_identity = create_run_identity(
+        cutoff_exclusive_utc=cutoff,
+        lifecycle_bundle_id=verified["bundle"]["bundle_id"],
+        lifecycle_approval_id=verified_approval["approval"]["approval_id"],
+        lifecycle_evidence_code_commit=lifecycle_commit,
+        acquisition_executable_commit=acquisition_auth["acquisition_executable_commit"],
+        acquisition_executable_tree_sha256=acquisition_executable_tree_sha256(root),
+        acquisition_authorization_id=acquisition_auth["authorization_id"],
+        config_sha256=verified["bundle"]["config"]["sha256"],
+        source_inventory_sha256=inventory["inventory_sha256"],
+        split_definitions=config["splits"],
+        run_id=run_id,
+    )
+    plan = create_frozen_plan(
+        run_identity=run_identity,
+        lifecycle_bundle=str(bundle_path),
+        lifecycle_approval=str(approval_path),
+        acquisition_authorization=str(acquisition_auth_path),
+        source_inventory_payload=inventory,
+        monthly_daily_boundary_utc=boundary,
+        server_time_evidence_path=str(server_time_path),
+        server_time_evidence_sha256=server_time_sha,
+        daily_discovery_pages=daily_pages,
+    )
+    plan_path = root / "reports" / f"full_source_plan_{run_id}.json"
+    write_json_exclusive(plan_path, plan)
+    print(f"Prepared {len(inventory['entries']):,} exact source entries in {plan_path}")
+    print(f"Frozen completed-1H cutoff: {cutoff}")
+    print("No historical market payload was downloaded.")
 
 
 if __name__ == "__main__":

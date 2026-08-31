@@ -42,6 +42,7 @@ def build_candidate_inventory(
     *,
     discovered_at: str,
     source_identifier: str,
+    discovery_layers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the replaceable machine inventory; this never supplies scope dispositions."""
     identities = canonical_candidate_set(candidates)
@@ -53,6 +54,10 @@ def build_candidate_inventory(
         "discovered_at": discovered_at,
         "source_identifier": source_identifier,
     }
+    if discovery_layers is not None:
+        if not discovery_layers:
+            raise ValueError("Candidate discovery layers must not be empty")
+        core["discovery_layers"] = discovery_layers
     return {**core, "inventory_id": _content_identity(core)}
 
 

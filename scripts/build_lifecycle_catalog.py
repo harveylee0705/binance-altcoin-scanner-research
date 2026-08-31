@@ -17,9 +17,11 @@ from alt_hot_scanner.data.binance_public import (
     INDEX_HOST,
     acquire_episode_first_observed_trade,
     acquire_first_observed_trade,
+    acquire_futures_server_time_snapshot,
     collision_resistant_run_id,
     discover_archive_months,
     discover_archive_symbol_candidates,
+    discover_frontier_daily_symbol_candidates,
     fetch_exchange_info_snapshot,
     list_archive_index,
     observed_daily_trade_keys_from_index_snapshots,
@@ -35,11 +37,14 @@ from alt_hot_scanner.data.provenance import (
 from alt_hot_scanner.identity import safe_identity_component
 from alt_hot_scanner.universe.adjudications import (
     BOUNDARY_INDEX_SCHEMA_VERSION,
+    episode_freshness_review_required,
     load_lifecycle_adjudications,
+    require_exclusive_utc_day_boundary,
     verify_boundary_index,
 )
 from alt_hot_scanner.universe.authorization import (
     build_bundle_payload,
+    build_lifecycle_freshness,
     catalog_readiness,
 )
 from alt_hot_scanner.universe.checkpoint import (
@@ -48,8 +53,10 @@ from alt_hot_scanner.universe.checkpoint import (
 )
 from alt_hot_scanner.universe.contracts import records_from_exchange_info
 from alt_hot_scanner.universe.delisting_registry import (
+    cms_corpus_binding,
     load_delisting_registry,
     verify_cms_corpus_binding,
+    verify_delisting_records_against_announcement_evidence,
 )
 from alt_hot_scanner.universe.eligibility_oracle import (
     EPISODE_EVIDENCE_SCHEMA_VERSION,
@@ -84,6 +91,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--delisting-registry", required=True)
     parser.add_argument("--delisting-review", required=True)
+    parser.add_argument(
+        "--required-valid-through-utc",
+        required=True,
+        help="Exact exclusive UTC day boundary required from lifecycle evidence",
+    )
     return parser.parse_args()
 
 
@@ -93,6 +105,9 @@ def _json_bytes(records: list[dict[str, Any]]) -> bytes:
 
 def main() -> None:
     args = parse_args()
+    require_exclusive_utc_day_boundary(
+        args.required_valid_through_utc, "required_valid_through_utc"
+    )
     root = Path(__file__).resolve().parents[1]
     config_path = root / "config" / "research_v0_1.yaml"
     config = load_config(config_path)
@@ -106,11 +121,26 @@ def main() -> None:
     discovered_at = datetime.now(UTC)
     archive_raw_paths: dict[str, list[str]] = {}
     archive_raw_hashes: dict[str, list[str]] = {}
+    server_time_evidence = acquire_futures_server_time_snapshot(
+        raw_root / "binance_futures_server_time.json"
+    )
+    if args.required_valid_through_utc > server_time_evidence[
+        "maximum_archive_backed_horizon_utc"
+    ]:
+        raise RuntimeError(
+            "Required freshness horizon exceeds the maximum previous-day Binance archive horizon"
+        )
 
     def observer(label: str):
         def save(page: int, url: str, payload: bytes) -> None:
             digest = hashlib.sha256(payload).hexdigest()
-            safe_label = "symbols" if label == "symbols" else safe_identity_component(label)
+            safe_label = (
+                "symbols"
+                if label == "symbols"
+                else "frontier_daily_symbols"
+                if label == "frontier_daily_symbols"
+                else safe_identity_component(label)
+            )
             path = raw_root / "archive_index" / f"{safe_label}_page_{page:03d}_{digest[:16]}.xml"
             if path.exists():
                 if sha256_file(path)[0] != digest:
@@ -129,6 +159,7 @@ def main() -> None:
         return save
 
     checkpoint_path = raw_root / "archive_checkpoint.json"
+    frontier_discovery: Any
     if args.resume_run:
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Archive checkpoint not found: {checkpoint_path}")
@@ -136,7 +167,12 @@ def main() -> None:
         symbols = checkpoint["canonical_symbols"]
         quarantined_prefixes = checkpoint["quarantined_prefixes"]
         symbol_audit = checkpoint["symbol_audit"]
+        archive_raw_paths["symbols"] = checkpoint["symbol_raw_snapshot_paths"]
+        archive_raw_hashes["symbols"] = checkpoint["symbol_raw_snapshot_sha256s"]
         archive_frame = pd.DataFrame(checkpoint["archive_observations"])
+        frontier_discovery = discover_frontier_daily_symbol_candidates(
+            page_observer=observer("frontier_daily_symbols")
+        )
     else:
         symbol_discovery = discover_archive_symbol_candidates(
             page_observer=observer("symbols")
@@ -159,6 +195,9 @@ def main() -> None:
             if position % 100 == 0:
                 print(f"Archive lifecycle bounds: {position}/{len(symbols)} symbols", flush=True)
         archive_frame = pd.DataFrame.from_records(observations)
+        frontier_discovery = discover_frontier_daily_symbol_candidates(
+            page_observer=observer("frontier_daily_symbols")
+        )
         write_json_exclusive(
             checkpoint_path,
             {
@@ -200,11 +239,36 @@ def main() -> None:
         stablecoin_underlyings=config["universe"]["stablecoin_underlyings"],
     )
 
-    all_candidates = sorted([*symbols, *quarantined_prefixes])
+    frontier_symbols = list(frontier_discovery.symbols)
+    frontier_quarantine = list(frontier_discovery.quarantined_prefixes)
+    all_candidates = sorted(
+        {*symbols, *quarantined_prefixes, *frontier_symbols, *frontier_quarantine}
+    )
+    monthly_discovery_layer = {
+        "layer": "historical_monthly_candidates",
+        "source_prefix": "data/futures/um/monthly/klines/",
+        "candidate_identities": sorted([*symbols, *quarantined_prefixes]),
+        "raw_snapshot_paths": archive_raw_paths.get("symbols", []),
+        "raw_snapshot_sha256s": archive_raw_hashes.get("symbols", []),
+        "retrieval_provenance": "immutable_raw_snapshot_sidecars",
+        "source_urls": symbol_audit.get("source_urls", []),
+        "index_audit": symbol_audit,
+    }
+    frontier_discovery_layer = {
+        "layer": "frontier_daily_candidates",
+        "source_prefix": "data/futures/um/daily/klines/",
+        "candidate_identities": sorted([*frontier_symbols, *frontier_quarantine]),
+        "raw_snapshot_paths": archive_raw_paths.get("frontier_daily_symbols", []),
+        "raw_snapshot_sha256s": archive_raw_hashes.get("frontier_daily_symbols", []),
+        "retrieval_provenance": "immutable_raw_snapshot_sidecars",
+        "source_urls": frontier_discovery.audit.source_urls,
+        "index_audit": asdict(frontier_discovery.audit),
+    }
     candidate_inventory = build_candidate_inventory(
         all_candidates,
         discovered_at=discovered_at.isoformat(),
-        source_identifier="official_binance_monthly_1h_archive_prefix_inventory",
+        source_identifier="official_binance_monthly_and_frontier_daily_archive_prefix_inventory",
+        discovery_layers=[monthly_discovery_layer, frontier_discovery_layer],
     )
     scope_registry_path = Path(args.scope_registry).resolve(strict=True)
     scope_registry = json.loads(scope_registry_path.read_text(encoding="utf-8"))
@@ -258,6 +322,35 @@ def main() -> None:
             [archive_frame, pd.DataFrame.from_records(extra_observations)], ignore_index=True
         )
 
+    # Preserve reviewed frontier candidates that do not have monthly evidence
+    # yet as explicit blocking catalog rows; never silently drop them.
+    daily_only_symbols = sorted(set(frontier_symbols) - set(symbols))
+    if daily_only_symbols:
+        frontier_blocked = [
+            {
+                "symbol": symbol,
+                "first_archive_month": None,
+                "last_archive_month": None,
+                "archive_discovery_timestamp": discovered_at.isoformat(),
+                "archive_source_url": INDEX_HOST,
+                "archive_discovery_provenance": (
+                    "frontier_daily_candidate_only_no_monthly_archive_blocking"
+                ),
+                "archive_parser_version": "binance-frontier-daily-candidate-v1",
+                "index_page_count": 0,
+                "returned_key_count": 0,
+                "unique_archive_count": 0,
+                "any_page_truncated": False,
+                "observed_archive_object_keys": [],
+                "archive_raw_snapshot_paths": [],
+                "archive_raw_snapshot_sha256s": [],
+            }
+            for symbol in daily_only_symbols
+        ]
+        archive_frame = pd.concat(
+            [archive_frame, pd.DataFrame.from_records(frontier_blocked)], ignore_index=True
+        )
+
     probe_symbols = sorted(
         identity
         for identity, scope in scope_by_identity.items()
@@ -290,11 +383,9 @@ def main() -> None:
     first_trade_frame = pd.DataFrame.from_records(first_trade_records)
 
     boundary_rows: list[dict[str, Any]] = []
-    for symbol, adjudication in sorted(lifecycle_adjudications["by_symbol"].items()):
-        if not adjudication.get("gap_evidence"):
-            continue
+    for symbol in probe_symbols:
         safe_symbol = safe_identity_component(symbol)
-        boundary_root = raw_root / "daily_trade_boundary_index"
+        boundary_root = raw_root / "daily_trade_frontier_index"
         existing_paths = sorted(boundary_root.glob(f"{safe_symbol}_page_*.xml"))
 
         def save_boundary_page(
@@ -311,7 +402,7 @@ def main() -> None:
                 return
             write_bytes_exclusive(path, payload)
             record_new_snapshot_provenance(
-                path, url=url, parser_version="binance-daily-trade-index-boundary-v1"
+                path, url=url, parser_version="binance-daily-trade-index-frontier-v1"
             )
 
         if not existing_paths:
@@ -320,9 +411,14 @@ def main() -> None:
                 page_observer=save_boundary_page,
             )
             existing_paths = sorted(boundary_root.glob(f"{safe_symbol}_page_*.xml"))
-        keys = observed_daily_trade_keys_from_index_snapshots(
-            [str(path.resolve()) for path in existing_paths], symbol
-        )
+        try:
+            keys = observed_daily_trade_keys_from_index_snapshots(
+                [str(path.resolve()) for path in existing_paths], symbol
+            )
+        except ValueError as exc:
+            if "No daily trade ZIP objects" not in str(exc):
+                raise
+            keys = ()
         dates = sorted({validate_daily_trade_object_key(key).period for key in keys})
         boundary_rows.append(
             {
@@ -333,11 +429,26 @@ def main() -> None:
                 "raw_snapshot_sha256s": [sha256_file(path)[0] for path in existing_paths],
                 "observed_archive_dates": dates,
                 "observed_archive_keys": list(keys),
-                "parser_version": "binance-daily-trade-index-boundary-v1",
+                "observed_daily_trade_dates": dates,
+                "parser_version": "binance-daily-trade-index-frontier-v1",
             }
         )
     verify_boundary_index(lifecycle_adjudications, boundary_rows)
-
+    episode_review = episode_freshness_review_required(
+        boundary_rows,
+        lifecycle_adjudications,
+        required_valid_through_utc=args.required_valid_through_utc,
+        reviewed_delisting_records=delisting_registry["records"],
+    )
+    if episode_review is not None:
+        report_root.mkdir(parents=True, exist_ok=False)
+        write_json_exclusive(report_root / "episode_freshness_review_required.json", episode_review)
+        raise RuntimeError("Episode freshness review is required; lifecycle adjudications were unchanged")
+    episode_freshness_evidence = {
+        "schema_version": "lifecycle-episode-freshness-v1",
+        "required_valid_through_utc": args.required_valid_through_utc,
+        "symbols": boundary_rows,
+    }
     first_trade_by_symbol = {row["symbol"]: row for row in first_trade_records}
     boundary_by_symbol = {row["symbol"]: row for row in boundary_rows}
     episode_trade_records: list[dict[str, Any]] = []
@@ -380,9 +491,74 @@ def main() -> None:
     }
 
     announcement_frame, announcement_audit = acquire_announcement_corpus(
-        raw_root / "announcements", set(symbols)
+        raw_root / "announcements", set(all_candidates)
     )
+    observed_cms_binding = cms_corpus_binding(announcement_audit)
+    if delisting_registry.get("official_cms_corpus") != observed_cms_binding:
+        report_root.mkdir(parents=True, exist_ok=False)
+        write_json_exclusive(
+            report_root / "delisting_freshness_review_required.json",
+            {
+                "schema_version": "lifecycle-delisting-freshness-review-required-v1",
+                "status": "review_required",
+                "observed_corpus": observed_cms_binding,
+                "reviewed_registry_corpus": delisting_registry.get("official_cms_corpus"),
+                "reviewed_registry_id": delisting_registry.get("registry_id"),
+                "mismatch": {
+                    "official_cms_corpus_changed": True,
+                    "registry_must_be_re-reviewed": True,
+                },
+                "reason": "Complete CMS acquisition is not exactly covered by the supplied reviewed delisting registry.",
+            },
+        )
+        raise RuntimeError("Refreshed CMS corpus requires delisting review")
     verify_cms_corpus_binding(delisting_registry, announcement_audit)
+    verify_delisting_records_against_announcement_evidence(
+        delisting_registry, announcement_frame.to_dict("records")
+    )
+    cms_started = pd.Timestamp(announcement_audit["rebuild_started_at"])
+    if cms_started.tzinfo is None:
+        cms_started = cms_started.tz_localize("UTC")
+    else:
+        cms_started = cms_started.tz_convert("UTC")
+    cms_started_utc = cms_started.isoformat().replace("+00:00", "Z")
+    server_horizon = server_time_evidence["maximum_archive_backed_horizon_utc"]
+    delisting_horizon = min(
+        (server_horizon, cms_started_utc),
+        key=lambda value: pd.Timestamp(value),
+    )
+    bound_raw_paths = {
+        server_time_evidence["path"],
+        *monthly_discovery_layer["raw_snapshot_paths"],
+        *frontier_discovery_layer["raw_snapshot_paths"],
+        *(path for row in boundary_rows for path in row["raw_snapshot_paths"]),
+        *(
+            str(path.resolve())
+            for path in (raw_root / "announcements").iterdir()
+            if path.is_file() and not path.name.endswith(".provenance.json")
+        ),
+    }
+    freshness = build_lifecycle_freshness(
+        required_valid_through_utc=args.required_valid_through_utc,
+        candidate_valid_through_utc=server_horizon,
+        episode_valid_through_utc=server_horizon,
+        delisting_valid_through_utc=delisting_horizon,
+        server_time_evidence=server_time_evidence,
+        frontier_candidate_discovery={
+            "layers": [monthly_discovery_layer, frontier_discovery_layer],
+            "candidate_set_digest": candidate_inventory["candidate_set_digest"],
+        },
+        episode_freshness_evidence=episode_freshness_evidence,
+        announcement_corpus={
+            "identity": observed_cms_binding["identity"],
+            "sha256": observed_cms_binding["sha256"],
+            "acquisition_started_at_utc": cms_started_utc,
+        },
+        bound_raw_evidence=[
+            {"path": path, "sha256": sha256_file(path)[0]}
+            for path in sorted(bound_raw_paths)
+        ],
+    )
     catalog = build_lifecycle_catalog(
         archive_frame,
         exchange_records,
@@ -404,10 +580,13 @@ def main() -> None:
         scope["product_scope"] in {"in_scope_crypto_perpetual", "benchmark_only"}
         for scope in scope_by_identity.values()
     )
+    all_quarantined = sorted({*quarantined_prefixes, *frontier_quarantine})
     coverage["unresolved_categories"]["noncanonical_archive_identities"] = len(
-        quarantined_prefixes
+        all_quarantined
     )
-    coverage["unresolved_categories"]["noncanonical_usdt_candidates"] = noncanonical_usdt
+    coverage["unresolved_categories"]["noncanonical_usdt_candidates"] = sum(
+        symbol.endswith("USDT") for symbol in all_quarantined
+    )
     coverage["archive_index"] = {
         **symbol_audit,
         "raw_symbol_index_snapshots": [
@@ -424,6 +603,13 @@ def main() -> None:
         "total_symbol_month_index_pages": int(archive_frame["index_page_count"].sum()),
         "total_returned_month_keys": int(archive_frame["returned_key_count"].sum()),
         "all_symbol_month_pages_completed": True,
+    }
+    coverage["candidate_discovery"] = {
+        "layers": [monthly_discovery_layer, frontier_discovery_layer],
+        "candidate_set_digest": candidate_inventory["candidate_set_digest"],
+        "historical_monthly_candidate_count": len(monthly_discovery_layer["candidate_identities"]),
+        "frontier_daily_candidate_count": len(frontier_discovery_layer["candidate_identities"]),
+        "union_candidate_count": len(all_candidates),
     }
     coverage["announcement_corpus"] = announcement_audit
     coverage["scope_registry"] = {
@@ -496,6 +682,7 @@ def main() -> None:
     write_json_exclusive(
         report_root / "episode_first_observed_trades.json", episode_evidence
     )
+    write_json_exclusive(report_root / "lifecycle_freshness.json", freshness)
     write_bytes_exclusive(
         report_root / "historical_delisting_cutoff_registry.json",
         delisting_registry_path.read_bytes(),
@@ -532,10 +719,10 @@ def main() -> None:
         report_root / "noncanonical_archive_prefix_queue.json",
         {
             "status": "reviewed_finite_universe",
-            "prefixes": quarantined_prefixes,
+            "prefixes": all_quarantined,
             "dispositions": {
                 identity: scope_by_identity[identity]["product_scope"]
-                for identity in quarantined_prefixes
+                for identity in all_quarantined
             },
         },
     )
@@ -630,7 +817,7 @@ def main() -> None:
     write_json_exclusive(report_root / "listing_reaudit.json", listing_reaudit)
     unresolved_noncanonical = [
         identity
-        for identity in quarantined_prefixes
+        for identity in all_quarantined
         if scope_by_identity[identity]["scope_audit_status"] != "complete"
     ]
     readiness = catalog_readiness(catalog, unresolved_noncanonical)
@@ -687,6 +874,7 @@ def main() -> None:
             "historical_scope_registry.json",
             "first_observed_trades.json",
             "episode_first_observed_trades.json",
+            "lifecycle_freshness.json",
             "historical_delisting_cutoff_registry.json",
             "delisting_registry_independent_review.json",
             "announcement_corpus_audit.json",

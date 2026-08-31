@@ -12,6 +12,7 @@ from alt_hot_scanner.data.announcements import (
     _symbols_in_order,
     classify_article_semantics,
 )
+from alt_hot_scanner.data.provenance import record_new_snapshot_provenance
 from alt_hot_scanner.universe.adjudications import load_lifecycle_adjudications
 from alt_hot_scanner.universe.authorization import (
     APPROVAL_SCHEMA_VERSION,
@@ -186,6 +187,11 @@ def test_primitive_manifest_detects_raw_evidence_mutation(tmp_path: Path) -> Non
     raw.mkdir()
     exchange = raw / "exchange_info.json"
     exchange.write_text('{"symbols": []}')
+    record_new_snapshot_provenance(
+        exchange,
+        url="https://official.example/exchangeInfo",
+        parser_version="fixture-exchange-v1",
+    )
     manifest = build_primitive_evidence_manifest(raw, first_trades=[])
     manifest_path = tmp_path / "primitive_evidence_manifest.json"
     manifest_path.write_text(json.dumps(manifest))

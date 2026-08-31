@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ from alt_hot_scanner.utils.numeric import strict_millisecond_timestamp
 
 ARCHIVE_HOST = "https://data.binance.vision"
 INDEX_HOST = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
+FUTURES_SERVER_TIME_URL = "https://fapi.binance.com/fapi/v1/time"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ARCHIVE_KEY = re.compile(
     r"data/futures/um/monthly/klines/"
@@ -703,9 +704,12 @@ def list_archive_index(
     if unicodedata.normalize("NFC", prefix) != prefix:
         raise ValueError("archive index prefix must use canonical Unicode encoding")
     canonical_prefix = prefix
-    allowed_prefix = canonical_prefix.startswith("data/futures/um/monthly/klines/") or (
-        canonical_prefix.startswith("data/futures/um/daily/trades/")
-        and "\\" not in canonical_prefix
+    allowed_prefix = canonical_prefix.startswith(
+        (
+            "data/futures/um/monthly/klines/",
+            "data/futures/um/daily/klines/",
+            "data/futures/um/daily/trades/",
+        )
     )
     if not allowed_prefix or "\\" in canonical_prefix:
         raise ValueError("Archive index prefix is outside an approved Binance USD-M hierarchy")
@@ -801,6 +805,86 @@ def list_archive_index(
             source_urls=tuple(source_urls),
         ),
     )
+
+
+def _parse_s3_index_request(
+    url: object, expected_prefix: str, expected_delimiter: str | None
+) -> str | None:
+    if type(url) is not str:
+        raise ValueError("Archive index provenance URL is malformed")
+    actual = urllib.parse.urlsplit(url)
+    expected = urllib.parse.urlsplit(INDEX_HOST)
+    if (
+        actual.scheme != "https"
+        or actual.netloc != expected.netloc
+        or actual.path != expected.path
+        or actual.fragment
+    ):
+        raise ValueError("Archive index provenance has the wrong S3 endpoint")
+    query = urllib.parse.parse_qs(actual.query, keep_blank_values=True)
+    expected_keys = {"list-type", "prefix"}
+    if expected_delimiter is not None:
+        expected_keys.add("delimiter")
+    if set(query) - (expected_keys | {"continuation-token"}) or set(query) < expected_keys:
+        raise ValueError("Archive index provenance has the wrong request parameters")
+    if any(len(values) != 1 for values in query.values()):
+        raise ValueError("Archive index provenance has duplicate request parameters")
+    if query.get("list-type") != ["2"] or query.get("prefix") != [expected_prefix]:
+        raise ValueError("Archive index provenance has the wrong request scope")
+    if expected_delimiter is not None and query.get("delimiter") != [expected_delimiter]:
+        raise ValueError("Archive index provenance has the wrong request scope")
+    token = query.get("continuation-token")
+    if token is not None and (not token[0] or token[0].isspace()):
+        raise ValueError("Archive index provenance has an invalid continuation token")
+    return token[0] if token is not None else None
+
+
+def _validate_s3_replay_page_chain(
+    page_numbers: list[int],
+    page_states: list[tuple[bool, str | None, str | None]],
+    *,
+    label: str,
+) -> None:
+    """Validate the common fail-closed invariants for preserved S3 pages."""
+    if len(page_numbers) != len(page_states):
+        raise ValueError(f"{label} snapshots have mismatched page identity and state counts")
+    if page_numbers != list(range(1, len(page_numbers) + 1)):
+        raise ValueError(f"{label} snapshots have a missing or reordered page")
+    if not page_states:
+        raise ValueError(f"{label} snapshots contain no pages")
+
+    seen_request_tokens: set[str] = set()
+    seen_returned_tokens: set[str] = set()
+    previous_next_token: str | None = None
+    previous_truncated = True
+    for index, (truncated, next_token, requested_token) in enumerate(page_states):
+        if index and not previous_truncated:
+            raise ValueError(f"{label} snapshots contain a page after a terminal page")
+        if requested_token is not None and requested_token in seen_request_tokens:
+            raise ValueError(f"{label} snapshots repeat a request/page identity")
+        if index == 0:
+            if requested_token is not None:
+                raise ValueError(f"{label} first page unexpectedly has a continuation token")
+        elif requested_token != previous_next_token:
+            raise ValueError(f"{label} provenance does not follow the continuation chain")
+        if requested_token is not None:
+            seen_request_tokens.add(requested_token)
+
+        if truncated:
+            if next_token is None or not next_token.strip():
+                raise ValueError(f"{label} truncated page has no usable continuation token")
+            next_token = require_canonical_text(next_token, f"{label} continuation token")
+            if next_token in seen_returned_tokens:
+                raise ValueError(f"{label} snapshots repeat a continuation token")
+            seen_returned_tokens.add(next_token)
+        elif next_token is not None and next_token.strip():
+            raise ValueError(f"{label} terminal page unexpectedly supplied a next token")
+
+        previous_truncated = truncated
+        previous_next_token = next_token if truncated else None
+
+    if page_states[-1][0]:
+        raise ValueError(f"{label} snapshots do not end at a complete page")
 
 
 def discover_earliest_daily_trade_archive(
@@ -1009,6 +1093,105 @@ def discover_archive_symbol_candidates(
     )
 
 
+def discover_frontier_daily_symbol_candidates(
+    *, page_observer: Callable[[int, str, bytes], None] | None = None
+) -> ArchiveSymbolDiscovery:
+    """Discover the complete frontier symbol-prefix layer from daily kline archives."""
+    prefix = "data/futures/um/daily/klines/"
+    listing = list_archive_index(prefix, delimiter="/", page_observer=page_observer)
+    symbols: list[str] = []
+    quarantined: list[str] = []
+    for item in listing.prefixes:
+        if not item.startswith(prefix) or not item.endswith("/"):
+            raise ValueError("Frontier daily symbol prefix has an invalid hierarchy")
+        relative = item[len(prefix) : -1]
+        if "/" in relative:
+            raise ValueError("Frontier daily symbol prefix contains unexpected nesting")
+        try:
+            symbols.append(require_binance_token(relative, "frontier daily archive symbol"))
+        except ValueError:
+            quarantined.append(relative)
+    unique_symbols = sorted(set(symbols))
+    quarantined = sorted(set(quarantined))
+    audit = ArchiveIndexAudit(
+        page_count=listing.audit.page_count,
+        returned_prefix_count=listing.audit.returned_prefix_count,
+        returned_key_count=listing.audit.returned_key_count,
+        unique_prefix_count=listing.audit.unique_prefix_count,
+        unique_key_count=listing.audit.unique_key_count,
+        any_page_truncated=listing.audit.any_page_truncated,
+        source_urls=listing.audit.source_urls,
+    )
+    if len(unique_symbols) + len(quarantined) != audit.unique_prefix_count:
+        raise ValueError("Frontier daily symbol validation changed the unique-prefix count")
+    return ArchiveSymbolDiscovery(
+        symbols=tuple(unique_symbols),
+        quarantined_prefixes=tuple(quarantined),
+        audit=audit,
+    )
+
+
+discover_frontier_archive_symbol_candidates = discover_frontier_daily_symbol_candidates
+
+
+def parse_futures_server_time(payload: bytes) -> datetime:
+    """Parse the exact Binance Futures server-time response used for freshness."""
+    try:
+        parsed = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Binance Futures server-time response is not valid JSON") from exc
+    if type(parsed) is not dict or set(parsed) != {"serverTime"}:
+        raise ValueError("Binance Futures server-time response has the wrong schema")
+    value = parsed["serverTime"]
+    if type(value) is not int or isinstance(value, bool) or value < 0:
+        raise ValueError("Binance Futures serverTime must be a nonnegative integer")
+    return datetime.fromtimestamp(value / 1000, UTC)
+
+
+def acquire_futures_server_time_snapshot(path: str | Path) -> dict[str, Any]:
+    """Capture immutable Binance Futures server time and return its evidence descriptor."""
+    from alt_hot_scanner.data.provenance import (
+        load_snapshot_provenance,
+        record_new_snapshot_provenance,
+    )
+
+    target = Path(path).resolve(strict=False)
+    url = FUTURES_SERVER_TIME_URL
+    if target.exists():
+        payload = target.read_bytes()
+        provenance = load_snapshot_provenance(
+            target, expected_url=url, expected_sha256=hashlib.sha256(payload).hexdigest()
+        )
+        if provenance is None:
+            raise ValueError("Cached Binance server-time evidence lacks immutable provenance")
+    else:
+        payload = _read_url(url)
+        _write_bytes_exclusive_atomic(target, payload)
+        record_new_snapshot_provenance(
+            target, url=url, parser_version="binance-futures-server-time-v1"
+        )
+        provenance = load_snapshot_provenance(
+            target, expected_url=url, expected_sha256=hashlib.sha256(payload).hexdigest()
+        )
+    server_time = parse_futures_server_time(payload)
+    digest, byte_count = sha256_file(target)
+    return {
+        "path": str(target),
+        "sha256": digest,
+        "source_url": url,
+        "original_retrieval_timestamp": provenance["original_retrieval_timestamp"]
+        if provenance is not None
+        else None,
+        "server_time_utc": server_time.isoformat().replace("+00:00", "Z"),
+        "server_date_utc": server_time.date().isoformat(),
+        "maximum_archive_backed_horizon_utc": (
+            datetime.combine(server_time.date(), datetime.min.time(), tzinfo=UTC)
+            - timedelta(days=1)
+        ).isoformat().replace("+00:00", "Z"),
+        "byte_count": byte_count,
+    }
+
+
 def discover_archive_symbols(
     *, page_observer: Callable[[int, str, bytes], None] | None = None
 ) -> tuple[list[str], ArchiveIndexAudit]:
@@ -1074,19 +1257,81 @@ def discover_archive_months(
 
 
 def observed_zip_keys_from_index_snapshots(
-    paths: list[str] | tuple[str, ...], symbol: str
+    paths: list[str] | tuple[str, ...],
+    symbol: str,
+    *,
+    expected_provenance_urls: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Recover exact ZIP objects from preserved official index pages; sidecars do not count."""
     canonical_symbol = require_archive_symbol_identity(symbol, "archive symbol")
     namespace_uri = "http://s3.amazonaws.com/doc/2006-03-01/"
     keys: set[str] = set()
+    expected_prefix = f"data/futures/um/monthly/klines/{canonical_symbol}/1h/"
+    page_states: list[tuple[bool, str | None, str | None]] = []
+    page_numbers: list[int] = []
+    from alt_hot_scanner.data.provenance import load_snapshot_provenance
+
     for raw_path in paths:
+        raw = Path(raw_path)
+        match = re.search(r"_page_(\d{3})_[0-9a-f]{16}\.xml$", raw.name)
+        if match is None:
+            if expected_provenance_urls is not None or len(paths) != 1:
+                raise ValueError("Archive index snapshot has no canonical page identity")
+            # Preserve the pre-manifest single-page checkpoint format. Canonical
+            # lifecycle replay pages still require their encoded page identity.
+            page_numbers.append(1)
+        else:
+            page_numbers.append(int(match.group(1)))
         try:
-            root = ET.fromstring(Path(raw_path).read_bytes())
+            payload = raw.read_bytes()
+            root = ET.fromstring(payload)
         except (OSError, ET.ParseError) as exc:
             raise ValueError(f"Cannot parse preserved archive index snapshot {raw_path}") from exc
         if root.tag != f"{{{namespace_uri}}}ListBucketResult":
             raise ValueError("Preserved archive index snapshot has an unexpected namespace")
+        expected_url = None
+        if expected_provenance_urls is not None:
+            expected_url = expected_provenance_urls.get(str(raw.resolve()))
+            if expected_url is None:
+                raise ValueError("Archive index snapshot lacks a manifest-bound URL")
+        provenance = load_snapshot_provenance(
+            raw, expected_url=expected_url, expected_sha256=hashlib.sha256(payload).hexdigest()
+        )
+        if provenance is None:
+            raise ValueError("Archive index snapshot lacks immutable provenance")
+        try:
+            requested_token = _parse_s3_index_request(provenance["url"], expected_prefix, None)
+        except ValueError:
+            if (
+                expected_provenance_urls is not None
+                or len(paths) != 1
+                or urllib.parse.urlsplit(provenance["url"]).query
+            ):
+                raise
+            # Legacy archive checkpoints predate S3 request-identity sidecars.
+            requested_token = None
+        truncated_nodes = root.findall(f"{{{namespace_uri}}}IsTruncated")
+        if len(truncated_nodes) != 1 or truncated_nodes[0].text not in {"true", "false"}:
+            raise ValueError("Archive index has an invalid truncation marker")
+        next_nodes = root.findall(f"{{{namespace_uri}}}NextContinuationToken")
+        if len(next_nodes) > 1:
+            raise ValueError("Archive index has duplicate continuation tokens")
+        next_token = next_nodes[0].text if next_nodes else None
+        page_prefixes = [
+            node.text for node in root.findall(f"{{{namespace_uri}}}CommonPrefixes/{{{namespace_uri}}}Prefix")
+        ]
+        page_keys = [
+            node.text for node in root.findall(f"{{{namespace_uri}}}Contents/{{{namespace_uri}}}Key")
+        ]
+        if any(
+            value is None or not value.startswith(expected_prefix)
+            for value in [*page_prefixes, *page_keys]
+        ):
+            raise ValueError("Archive index contains an entry outside the requested prefix")
+        key_counts = root.findall(f"{{{namespace_uri}}}KeyCount")
+        if len(key_counts) != 1 or key_counts[0].text != str(len(page_prefixes) + len(page_keys)):
+            raise ValueError("Archive index KeyCount disagrees with returned entries")
+        page_states.append((truncated_nodes[0].text == "true", next_token, requested_token))
         for node in root.findall(f"{{{namespace_uri}}}Contents/{{{namespace_uri}}}Key"):
             key = node.text
             if not key or key.endswith(".CHECKSUM"):
@@ -1095,21 +1340,57 @@ def observed_zip_keys_from_index_snapshots(
             if identity.symbol != canonical_symbol:
                 raise ValueError("Preserved archive index snapshot contains a mismatched symbol")
             keys.add(identity.object_key)
+    _validate_s3_replay_page_chain(
+        page_numbers,
+        page_states,
+        label="Archive index",
+    )
     if not keys:
         raise ValueError(f"No actual ZIP objects found in preserved index pages for {symbol}")
     return tuple(sorted(keys))
 
 
 def observed_daily_trade_keys_from_index_snapshots(
-    paths: list[str] | tuple[str, ...], symbol: str
+    paths: list[str] | tuple[str, ...],
+    symbol: str,
+    *,
+    expected_provenance_urls: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Recover exact daily trade ZIP identities from complete preserved S3 index pages."""
     semantic_symbol = require_semantic_contract_identity(symbol, "daily trade index symbol")
     namespace_uri = "http://s3.amazonaws.com/doc/2006-03-01/"
     keys: set[str] = set()
+    page_numbers: list[int] = []
+    page_states: list[tuple[bool, str | None, str | None]] = []
+    expected_prefix = f"data/futures/um/daily/trades/{semantic_symbol}/"
     for raw_path in paths:
+        match = re.search(r"_page_(\d{3})_[0-9a-f]{16}\.xml$", Path(raw_path).name)
+        if match is None:
+            raise ValueError("Daily trade index snapshot has no canonical page identity")
+        page_numbers.append(int(match.group(1)))
+    if page_numbers != list(range(1, len(page_numbers) + 1)):
+        raise ValueError("Daily trade index snapshots have a missing or reordered page")
+    from alt_hot_scanner.data.provenance import load_snapshot_provenance
+
+    for raw_path in paths:
+        raw = Path(raw_path)
+        digest = hashlib.sha256(raw.read_bytes()).hexdigest()
+        expected_url = None
+        if expected_provenance_urls is not None:
+            expected_url = expected_provenance_urls.get(str(raw.resolve()))
+            if expected_url is None:
+                raise ValueError("Daily trade index snapshot lacks a manifest-bound URL")
+        provenance = load_snapshot_provenance(
+            raw, expected_url=expected_url, expected_sha256=digest
+        )
+        if provenance is None:
+            raise ValueError("Daily trade index snapshot lacks immutable provenance")
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(provenance["url"]).query)
+        if query.get("prefix") != [expected_prefix]:
+            raise ValueError("Daily trade index provenance has the wrong prefix")
+        requested_token = _parse_s3_index_request(provenance["url"], expected_prefix, None)
         try:
-            root = ET.fromstring(Path(raw_path).read_bytes())
+            root = ET.fromstring(raw.read_bytes())
         except (OSError, ET.ParseError) as exc:
             raise ValueError(f"Cannot parse preserved daily trade index {raw_path}") from exc
         if root.tag != f"{{{namespace_uri}}}ListBucketResult":
@@ -1117,6 +1398,15 @@ def observed_daily_trade_keys_from_index_snapshots(
         truncated = root.findall(f"{{{namespace_uri}}}IsTruncated")
         if len(truncated) != 1 or truncated[0].text not in {"true", "false"}:
             raise ValueError("Daily trade index has an invalid truncation marker")
+        next_nodes = root.findall(f"{{{namespace_uri}}}NextContinuationToken")
+        if len(next_nodes) > 1:
+            raise ValueError("Daily trade index has duplicate continuation tokens")
+        next_token = next_nodes[0].text if next_nodes else None
+        contents = root.findall(f"{{{namespace_uri}}}Contents/{{{namespace_uri}}}Key")
+        key_count_nodes = root.findall(f"{{{namespace_uri}}}KeyCount")
+        if len(key_count_nodes) != 1 or key_count_nodes[0].text != str(len(contents)):
+            raise ValueError("Daily trade index KeyCount disagrees with returned entries")
+        page_states.append((truncated[0].text == "true", next_token, requested_token))
         for node in root.findall(f"{{{namespace_uri}}}Contents/{{{namespace_uri}}}Key"):
             key = node.text
             if not key or key.endswith(".CHECKSUM"):
@@ -1125,6 +1415,11 @@ def observed_daily_trade_keys_from_index_snapshots(
             if identity.symbol != semantic_symbol:
                 raise ValueError("Daily trade index contains a mismatched symbol")
             keys.add(identity.object_key)
+    _validate_s3_replay_page_chain(
+        page_numbers,
+        page_states,
+        label="Daily trade index",
+    )
     if not keys:
         raise ValueError(f"No daily trade ZIP objects found for {semantic_symbol}")
     return tuple(sorted(keys))

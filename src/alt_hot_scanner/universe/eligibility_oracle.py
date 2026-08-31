@@ -66,6 +66,9 @@ def _cms_binding(audit: dict[str, Any]) -> dict[str, Any]:
         "candidate_articles": catalog.get("candidate_articles"),
         "inspection_policy": catalog.get("inspection_policy"),
         "page_sha256s": catalog.get("page_sha256s"),
+        "detail_sha256s": sorted(
+            catalog.get("detail_sha256s", []), key=lambda item: item.get("article_code", "")
+        ),
     }
     digest = content_identity(stable)
     return {"identity": digest, "sha256": digest, "delisting_catalog_id": catalog["catalog_id"]}
@@ -130,6 +133,10 @@ def derive_expected_eligibility(report_root: str | Path) -> dict[str, Any]:
     }
     primitive_by_path = {str(Path(row["path"]).resolve()): row for row in primitive["entries"]}
     boundary_by_symbol = {row["symbol"]: row for row in boundaries}
+    archive_rows = _load(root / "archive_observations.json")
+    archive_by_symbol = {row.get("symbol"): row for row in archive_rows}
+    if len(archive_by_symbol) != len(archive_rows):
+        raise ValueError("Archive observations contain duplicate identities")
     if len(trade_by_episode) != len(episode_evidence["records"]):
         raise ValueError("Episode first-trade evidence contains duplicate episodes")
     if len(cutoff_by_episode) != len(delisting["records"]):
@@ -156,6 +163,13 @@ def derive_expected_eligibility(report_root: str | Path) -> dict[str, Any]:
                 else "episode_first_observed_trade_zip"
             )
             conflict = None
+            archive = archive_by_symbol.get(symbol)
+            if (
+                archive is None
+                or type(archive.get("observed_archive_object_keys")) is not list
+                or not archive.get("observed_archive_object_keys")
+            ):
+                conflict = "missing_monthly_archive_observation"
             if (
                 trade is None
                 or trade.get("symbol") != symbol

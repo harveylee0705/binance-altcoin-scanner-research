@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,9 @@ def cms_corpus_binding(audit: dict[str, Any]) -> dict[str, Any]:
         "candidate_articles": catalog.get("candidate_articles"),
         "inspection_policy": catalog.get("inspection_policy"),
         "page_sha256s": catalog.get("page_sha256s"),
+        "detail_sha256s": sorted(
+            catalog.get("detail_sha256s", []), key=lambda item: item.get("article_code", "")
+        ),
     }
     digest = _identity(stable)
     return {"identity": digest, "sha256": digest, "delisting_catalog_id": catalog["catalog_id"]}
@@ -43,6 +47,103 @@ def cms_corpus_binding(audit: dict[str, Any]) -> dict[str, Any]:
 def verify_cms_corpus_binding(registry: dict[str, Any], audit: dict[str, Any]) -> None:
     if registry.get("official_cms_corpus") != cms_corpus_binding(audit):
         raise ValueError("Delisting registry targets a stale or wrong official CMS corpus")
+
+
+def _utc_instant(value: Any, field: str) -> datetime:
+    if type(value) is not str:
+        raise ValueError(f"Delisting {field} is not an exact UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"Delisting {field} is not an exact UTC timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"Delisting {field} is not an exact UTC timestamp")
+    return parsed.astimezone(UTC)
+
+
+def verify_delisting_records_against_announcement_evidence(
+    registry: dict[str, Any], announcement_evidence: list[dict[str, Any]]
+) -> None:
+    """Bind accepted reviewed delisting records to independently derived CMS rows."""
+    records = registry.get("records")
+    if type(records) is not list or type(announcement_evidence) is not list:
+        raise ValueError("Delisting registry or announcement evidence is malformed")
+    for record in records:
+        if type(record) is not dict:
+            raise ValueError("Delisting registry record is malformed")
+        if record.get("review_status") != "accepted_exact_cutoff":
+            continue
+        if (
+            type(record.get("symbol")) is not str
+            or type(record.get("article_code")) is not str
+            or type(record.get("official_article_url")) is not str
+            or _SHA256.fullmatch(str(record.get("raw_article_sha256"))) is None
+        ):
+            raise ValueError("Accepted delisting cutoff lacks exact official evidence")
+        if record.get("product_event_disposition") != "binance_usdm_futures_termination":
+            raise ValueError("Accepted delisting cutoff has the wrong product disposition")
+
+        symbol = record.get("symbol")
+        applicable = [
+            row
+            for row in announcement_evidence
+            if type(row) is dict
+            and row.get("event_type") == "delisting"
+            and row.get("symbol") == symbol
+            and row.get("article_code") == record.get("article_code")
+        ]
+        if len(applicable) != 1:
+            raise ValueError(
+                "Accepted delisting cutoff does not have exactly one applicable replayed evidence row"
+            )
+        evidence = applicable[0]
+        exact_fields = (
+            ("article_code", "article_code"),
+            ("raw_article_sha256", "raw_snapshot_sha256"),
+            ("official_article_url", "source_url"),
+        )
+        if any(
+            record.get(registry_field) != evidence.get(evidence_field)
+            for registry_field, evidence_field in exact_fields
+        ):
+            raise ValueError("Accepted delisting cutoff does not bind the replayed article evidence")
+        if (
+            evidence.get("match_status") != "accepted"
+            or evidence.get("article_semantic_class") != "delisting_or_settlement"
+            or evidence.get("semantic_evidence_status")
+            != "accepted_positive_semantic_evidence"
+        ):
+            raise ValueError("Accepted delisting cutoff is supported by non-accepted semantic evidence")
+        if _utc_instant(
+            record.get("official_publication_timestamp"), "publication timestamp"
+        ) != _utc_instant(evidence.get("article_published_at"), "article publication timestamp"):
+            raise ValueError("Accepted delisting cutoff publication timestamp does not match replayed evidence")
+
+        terminal = record.get("terminal_last_trading_at")
+        official_event_at = evidence.get("official_event_at")
+        if terminal is None:
+            if official_event_at is not None:
+                raise ValueError(
+                    "Accepted delisting cutoff omits a replayed terminal event time"
+                )
+            if evidence.get("event_time_evidence_status") == "action_symbol_time_anchored":
+                raise ValueError(
+                    "Replayed terminal event evidence is internally contradictory"
+                )
+        else:
+            if (
+                evidence.get("event_time_evidence_status") != "action_symbol_time_anchored"
+                or official_event_at is None
+            ):
+                raise ValueError(
+                    "Accepted delisting cutoff lacks an anchored replayed terminal event time"
+                )
+            if _utc_instant(terminal, "terminal last-trading timestamp") != _utc_instant(
+                official_event_at, "official event timestamp"
+            ):
+                raise ValueError(
+                    "Accepted delisting cutoff terminal timestamp does not match replayed evidence"
+                )
 
 
 def load_delisting_registry(

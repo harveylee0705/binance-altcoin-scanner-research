@@ -40,7 +40,7 @@ def record_new_snapshot_provenance(
 def load_snapshot_provenance(
     snapshot_path: str | Path,
     *,
-    expected_url: str,
+    expected_url: str | None = None,
     expected_sha256: str,
 ) -> dict[str, Any] | None:
     """Load and verify an immutable sidecar; legacy bytes without one stay unresolved."""
@@ -50,7 +50,9 @@ def load_snapshot_provenance(
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema_version") != PROVENANCE_SCHEMA_VERSION:
         raise ValueError("Raw source provenance has an unsupported schema")
-    if payload.get("url") != expected_url or payload.get("sha256") != expected_sha256:
+    if (expected_url is not None and payload.get("url") != expected_url) or payload.get(
+        "sha256"
+    ) != expected_sha256:
         raise ValueError("Raw source provenance does not match the cached snapshot")
     if payload.get("local_snapshot_path") != str(Path(snapshot_path).resolve()):
         raise ValueError("Raw source provenance path does not match the cached snapshot")

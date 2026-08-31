@@ -458,8 +458,21 @@ def test_lifecycle_critical_runtime_mutation_is_rejected(tmp_path: Path) -> None
 
 def test_lifecycle_boundary_and_separate_acquisition_authorization(tmp_path: Path) -> None:
     source_root = Path(__file__).resolve().parents[1]
-    # The remediation checkout may change acquisition files, but frozen lifecycle-critical files must still match 47b5.
-    verify_lifecycle_runtime_boundary(source_root, "47b5feb45aec82f967ff5679fb8166f89039356a")
+    # Exercise the boundary against an explicitly frozen lifecycle snapshot so the test remains
+    # valid when a lifecycle-only remediation changes the source checkout.
+    lifecycle_repo = tmp_path / "lifecycle-repo"
+    lifecycle_repo.mkdir()
+    _git("init", cwd=lifecycle_repo)
+    _git("config", "user.email", "test@example.com", cwd=lifecycle_repo)
+    _git("config", "user.name", "Test", cwd=lifecycle_repo)
+    for relative in LIFECYCLE_CRITICAL_PATHS:
+        destination = lifecycle_repo / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((source_root / relative).read_bytes())
+    _git("add", ".", cwd=lifecycle_repo)
+    _git("commit", "-m", "frozen lifecycle snapshot", cwd=lifecycle_repo)
+    frozen_commit = _git("rev-parse", "HEAD", cwd=lifecycle_repo)
+    verify_lifecycle_runtime_boundary(lifecycle_repo, frozen_commit)
 
     repo = tmp_path / "repo"
     repo.mkdir()

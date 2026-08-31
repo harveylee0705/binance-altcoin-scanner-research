@@ -488,6 +488,7 @@ def acquire_announcement_corpus(
         articles: list[dict[str, Any]] = []
         expected_total: int | None = None
         page_checksums: list[str] = []
+        detail_checksums: list[dict[str, str]] = []
         while expected_total is None or len(articles) < expected_total:
             url = (
                 f"{ANNOUNCEMENT_API}/list/query?type=1&pageNo={page}"
@@ -546,6 +547,7 @@ def acquire_announcement_corpus(
             article_was_cached = bool(list(root.glob(article_pattern)))
             payload = read_source(url, article_pattern)
             checksum = hashlib.sha256(payload).hexdigest()
+            detail_checksums.append({"article_code": code, "sha256": checksum})
             raw_path = root / f"article_{code}_{checksum[:16]}.json"
             _preserve_raw(raw_path, payload)
             if not article_was_cached:
@@ -594,6 +596,9 @@ def acquire_announcement_corpus(
                     else "strict_positive_listing_title_prefilter"
                 ),
                 "page_sha256s": page_checksums,
+                "detail_sha256s": sorted(
+                    detail_checksums, key=lambda item: item["article_code"]
+                ),
             }
         )
 

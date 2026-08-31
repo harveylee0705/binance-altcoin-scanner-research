@@ -1,6 +1,6 @@
 # Historical USD-M Contract Lifecycle Catalog
 
-Schema version: `binance-usdm-lifecycle-v5`
+Schema version: `binance-usdm-lifecycle-v5`; lifecycle authorization bundle: `lifecycle-authorization-bundle-v5`.
 
 The catalog is research infrastructure, not a scanner result. Build it with:
 
@@ -9,8 +9,17 @@ The catalog is research infrastructure, not a scanner result. Build it with:
   --scope-registry config/reviewed_scope_registry_b323b3c3.json `
   --adjudications config/lifecycle_adjudications_v1.json `
   --delisting-registry config/historical_delisting_cutoff_registry.json `
-  --delisting-review docs/reviews/delisting_registry_independent_review_2026-08-24.json
+  --delisting-review docs/reviews/delisting_registry_independent_review_2026-08-24.json `
+  --required-valid-through-utc 2026-08-30T00:00:00Z
 ```
+
+Lifecycle candidate discovery is the deterministic union of the complete historical monthly
+`data/futures/um/monthly/klines/` prefix inventory and the complete frontier daily
+`data/futures/um/daily/klines/` prefix inventory. Current `exchangeInfo` is classification
+evidence only and cannot remove an archive-discovered identity. The build writes
+`lifecycle_freshness.json`, whose exclusive common horizon is the minimum of the candidate,
+episode, and delisting component horizons. Daily archive evidence is capped at 00:00 UTC of
+the previous Binance Futures server-date calendar day.
 
 This performs metadata-only acquisition. It does not download monthly OHLCV archives, compute
 HotScore, label outcomes, or read validation/holdout scanner observations.

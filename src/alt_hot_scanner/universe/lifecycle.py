@@ -332,6 +332,10 @@ def build_lifecycle_catalog(
             }
         )
 
+        monthly_archive_bound = archive_row.get("archive_discovery_provenance") != (
+            "frontier_daily_candidate_only_no_monthly_archive_blocking"
+        )
+
         if not current_by_symbol.empty and symbol in current_by_symbol.index:
             current = current_by_symbol.loc[symbol]
             record["present_in_current_exchange_info"] = True
@@ -474,6 +478,38 @@ def build_lifecycle_catalog(
             "in_scope_crypto_perpetual",
             "benchmark_only",
         }
+        if is_trading:
+            captured_at = record.get("metadata_acquired_at") or created
+            reviewed_episode_positions = {
+                int(episode["episode_id"].rsplit(":", 1)[1])
+                for episode in (adjudication or {}).get("episodes", [])
+                if type(episode.get("episode_id")) is str
+                and episode["episode_id"].startswith(f"{symbol}:")
+                and episode["episode_id"].rsplit(":", 1)[1].isdigit()
+            }
+            for cutoff in delisting_registry_records or []:
+                if (
+                    cutoff.get("symbol") != symbol
+                    or cutoff.get("review_status") != "accepted_exact_cutoff"
+                    or cutoff.get("terminal_last_trading_at") is None
+                ):
+                    continue
+                episode_id = cutoff.get("lifecycle_episode_id")
+                if type(episode_id) is not str or not episode_id.startswith(f"{symbol}:"):
+                    raise ValueError("Reviewed delisting cutoff has an invalid lifecycle episode")
+                try:
+                    episode_position = int(episode_id.rsplit(":", 1)[1])
+                    terminal_at = pd.Timestamp(cutoff["terminal_last_trading_at"])
+                    captured_timestamp = pd.Timestamp(captured_at)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Reviewed delisting cutoff has invalid timestamp evidence") from exc
+                if (
+                    captured_timestamp > terminal_at
+                    and not any(position > episode_position for position in reviewed_episode_positions)
+                ):
+                    raise ValueError(
+                        "Reviewed terminal cannot coexist with a later-current state without a reviewed later lifecycle episode"
+                    )
         if adjudication is not None:
             intervals = _adjudicated_intervals(
                 record,
@@ -680,6 +716,7 @@ def build_lifecycle_catalog(
         ready = (
             classification_complete
             and in_research_scope
+            and monthly_archive_bound
             and listing_complete
             and delisting_ready
             and bool(intervals)
@@ -703,7 +740,9 @@ def build_lifecycle_catalog(
                 ),
                 "delisting_evidence_state": delisting_state,
                 "current_status_warning": (
-                    None if is_trading else f"current_status_{status or 'archive_only'}"
+                    "frontier_daily_only_no_monthly_archive"
+                    if not monthly_archive_bound
+                    else None if is_trading else f"current_status_{status or 'archive_only'}"
                 ),
                 "onboard_start_discrepancy_seconds": difference,
                 "onboard_start_discrepancy_status": discrepancy_status,

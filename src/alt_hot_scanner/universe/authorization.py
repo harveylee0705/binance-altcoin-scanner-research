@@ -3,19 +3,34 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from alt_hot_scanner.data.binance_public import validate_archive_object_key
+from alt_hot_scanner.data.binance_public import (
+    FUTURES_SERVER_TIME_URL,
+    parse_futures_server_time,
+    validate_archive_object_key,
+)
+from alt_hot_scanner.universe.adjudications import (
+    load_lifecycle_adjudications,
+    require_exclusive_utc_day_boundary,
+    require_exclusive_utc_timestamp,
+)
 from alt_hot_scanner.universe.contracts import filter_instrument_scope
+from alt_hot_scanner.universe.delisting_registry import cms_corpus_binding
 from alt_hot_scanner.universe.eligibility_oracle import run_eligibility_oracle
 from alt_hot_scanner.universe.lifecycle import CATALOG_SCHEMA_VERSION
-from alt_hot_scanner.universe.scope_registry import verify_scope_registry
+from alt_hot_scanner.universe.scope_registry import (
+    candidate_set_digest,
+    verify_scope_registry,
+)
 from alt_hot_scanner.utils.config import load_config
 
-BUNDLE_SCHEMA_VERSION = "lifecycle-authorization-bundle-v4"
+BUNDLE_SCHEMA_VERSION = "lifecycle-authorization-bundle-v5"
+FRESHNESS_SCHEMA_VERSION = "lifecycle-freshness-v1"
 APPROVAL_SCHEMA_VERSION = "lifecycle-approval-pin-v2"
 APPROVAL_STATE_SCHEMA_VERSION = "lifecycle-approval-state-registry-v1"
 PLAN_SCHEMA_VERSION = "full-history-download-plan-v4"
@@ -55,6 +70,172 @@ def sha256_path(path: str | Path) -> str:
 
 def content_identity(value: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _parse_utc(value: str, field: str) -> datetime:
+    require_exclusive_utc_timestamp(value, field)
+    return datetime.fromisoformat(value)
+
+
+def build_lifecycle_freshness(
+    *,
+    required_valid_through_utc: str,
+    candidate_valid_through_utc: str,
+    episode_valid_through_utc: str,
+    delisting_valid_through_utc: str,
+    server_time_evidence: dict[str, Any],
+    frontier_candidate_discovery: dict[str, Any],
+    episode_freshness_evidence: dict[str, Any],
+    announcement_corpus: dict[str, Any],
+    bound_raw_evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    require_exclusive_utc_day_boundary(
+        required_valid_through_utc, "required_valid_through_utc"
+    )
+    for name, value in (
+        ("candidate_valid_through_utc", candidate_valid_through_utc),
+        ("episode_valid_through_utc", episode_valid_through_utc),
+        ("delisting_valid_through_utc", delisting_valid_through_utc),
+    ):
+        require_exclusive_utc_timestamp(value, name)
+    common = min(
+        candidate_valid_through_utc,
+        episode_valid_through_utc,
+        delisting_valid_through_utc,
+        key=lambda value: _parse_utc(value, "component horizon"),
+    )
+    required_dt = _parse_utc(required_valid_through_utc, "required_valid_through_utc")
+    if _parse_utc(common, "lifecycle_evidence_valid_through_utc") < required_dt:
+        raise ValueError("Lifecycle evidence cannot support the required freshness horizon")
+    core = {
+        "schema_version": FRESHNESS_SCHEMA_VERSION,
+        "boundary_semantics": "exclusive",
+        "required_valid_through_utc": required_valid_through_utc,
+        "candidate_valid_through_utc": candidate_valid_through_utc,
+        "episode_valid_through_utc": episode_valid_through_utc,
+        "delisting_valid_through_utc": delisting_valid_through_utc,
+        "lifecycle_evidence_valid_through_utc": common,
+        "binance_server_time_evidence": server_time_evidence,
+        "frontier_candidate_discovery": frontier_candidate_discovery,
+        "episode_freshness_evidence": episode_freshness_evidence,
+        "announcement_corpus": announcement_corpus,
+        "bound_raw_evidence": bound_raw_evidence,
+    }
+    return {**core, "freshness_id": content_identity(core)}
+
+
+def validate_lifecycle_freshness(
+    payload: dict[str, Any], *, report_root: str | Path | None = None
+) -> dict[str, Any]:
+    """Validate exact freshness structure, identities, horizons, and bound raw bytes."""
+    required = {
+        "schema_version",
+        "boundary_semantics",
+        "required_valid_through_utc",
+        "candidate_valid_through_utc",
+        "episode_valid_through_utc",
+        "delisting_valid_through_utc",
+        "lifecycle_evidence_valid_through_utc",
+        "binance_server_time_evidence",
+        "frontier_candidate_discovery",
+        "episode_freshness_evidence",
+        "announcement_corpus",
+        "bound_raw_evidence",
+        "freshness_id",
+    }
+    if type(payload) is not dict or set(payload) != required:
+        raise ValueError("Lifecycle freshness artifact has the wrong schema")
+    if payload["schema_version"] != FRESHNESS_SCHEMA_VERSION:
+        raise ValueError("Lifecycle freshness artifact has an unsupported schema")
+    if payload["boundary_semantics"] != "exclusive":
+        raise ValueError("Lifecycle freshness artifact must use exclusive boundaries")
+    require_exclusive_utc_day_boundary(
+        payload["required_valid_through_utc"], "required_valid_through_utc"
+    )
+    for field in (
+        "candidate_valid_through_utc",
+        "episode_valid_through_utc",
+        "delisting_valid_through_utc",
+        "lifecycle_evidence_valid_through_utc",
+    ):
+        require_exclusive_utc_timestamp(payload[field], field)
+    expected_common = min(
+        (payload[field] for field in (
+            "candidate_valid_through_utc",
+            "episode_valid_through_utc",
+            "delisting_valid_through_utc",
+        )),
+        key=lambda value: _parse_utc(value, "component horizon"),
+    )
+    if payload["lifecycle_evidence_valid_through_utc"] != expected_common:
+        raise ValueError("Lifecycle freshness common horizon is not the component minimum")
+    if _parse_utc(expected_common, "common horizon") < _parse_utc(
+        payload["required_valid_through_utc"], "required_valid_through_utc"
+    ):
+        raise ValueError("Lifecycle freshness is below the required horizon")
+    core = {key: value for key, value in payload.items() if key != "freshness_id"}
+    if payload["freshness_id"] != content_identity(core):
+        raise ValueError("Lifecycle freshness identity is invalid")
+
+    descriptors = payload["bound_raw_evidence"]
+    if type(descriptors) is not list or len({item.get("path") for item in descriptors}) != len(descriptors):
+        raise ValueError("Lifecycle freshness raw evidence descriptors are not unique")
+    for descriptor in descriptors:
+        if type(descriptor) is not dict or set(descriptor) != {"path", "sha256"}:
+            raise ValueError("Lifecycle freshness raw evidence descriptor is malformed")
+        if not isinstance(descriptor["path"], str) or not isinstance(
+            descriptor["sha256"], str
+        ) or len(descriptor["sha256"]) != 64 or any(
+            character not in "0123456789abcdef" for character in descriptor["sha256"]
+        ):
+            raise ValueError("Lifecycle freshness raw evidence descriptor is invalid")
+        if report_root is not None and sha256_path(descriptor["path"]) != descriptor["sha256"]:
+            raise ValueError(f"Lifecycle freshness raw evidence hash mismatch: {descriptor['path']}")
+    server = payload["binance_server_time_evidence"]
+    if type(server) is not dict or not {"path", "sha256", "source_url", "server_time_utc", "server_date_utc", "maximum_archive_backed_horizon_utc"}.issubset(server):
+        raise ValueError("Binance server-time evidence descriptor is incomplete")
+    require_exclusive_utc_timestamp(server["server_time_utc"], "server_time_utc")
+    if server["source_url"] != FUTURES_SERVER_TIME_URL:
+        raise ValueError("Binance server-time evidence has the wrong source URL")
+    require_exclusive_utc_day_boundary(
+        server["maximum_archive_backed_horizon_utc"],
+        "maximum_archive_backed_horizon_utc",
+    )
+    if report_root is not None and sha256_path(server["path"]) != server["sha256"]:
+        raise ValueError("Binance server-time evidence hash mismatch")
+    if report_root is not None:
+        observed_server_time = parse_futures_server_time(Path(server["path"]).read_bytes())
+        expected_server_time = observed_server_time.isoformat().replace("+00:00", "Z")
+        expected_server_date = observed_server_time.date().isoformat()
+        expected_archive_horizon = (
+            observed_server_time.replace(hour=0, minute=0, second=0, microsecond=0)
+            - timedelta(days=1)
+        ).isoformat().replace("+00:00", "Z")
+        if (
+            server["server_time_utc"] != expected_server_time
+            or server["server_date_utc"] != expected_server_date
+            or server["maximum_archive_backed_horizon_utc"] != expected_archive_horizon
+        ):
+            raise ValueError("Binance server-time descriptor disagrees with its raw evidence")
+    if {item["path"] for item in descriptors} != {
+        item["path"] for item in descriptors
+    } | {server["path"]}:
+        raise ValueError("Freshness raw evidence does not include server-time evidence")
+    corpus = payload["announcement_corpus"]
+    if type(corpus) is not dict or set(corpus) != {
+        "identity", "sha256", "acquisition_started_at_utc"
+    }:
+        raise ValueError("Announcement corpus freshness binding is malformed")
+    if corpus["identity"] != corpus["sha256"] or len(corpus["identity"]) != 64:
+        raise ValueError("Announcement corpus freshness binding is invalid")
+    require_exclusive_utc_timestamp(
+        corpus["acquisition_started_at_utc"], "acquisition_started_at_utc"
+    )
+    if _parse_utc(
+        payload["delisting_valid_through_utc"], "delisting_valid_through_utc"
+    ) > _parse_utc(corpus["acquisition_started_at_utc"], "acquisition_started_at_utc"):
+        raise ValueError("Delisting freshness exceeds the frozen CMS acquisition start")
+    return payload
 
 
 def catalog_readiness(catalog: pd.DataFrame, noncanonical_candidates: list[str]) -> dict[str, Any]:
@@ -110,6 +291,8 @@ def build_bundle_payload(
     code_commit: str,
     created_at: str,
 ) -> dict[str, Any]:
+    if "lifecycle_freshness.json" not in artifact_names:
+        raise ValueError("Lifecycle bundle must bind lifecycle_freshness.json")
     artifacts = {
         name: {"path": name, "sha256": sha256_path(report_root / name)}
         for name in sorted(artifact_names)
@@ -133,11 +316,18 @@ def build_bundle_payload(
     adjudications = json.loads(
         (report_root / "lifecycle_adjudications.json").read_text("utf-8")
     )
+    freshness = json.loads(
+        (report_root / "lifecycle_freshness.json").read_text("utf-8")
+    )
+    validate_lifecycle_freshness(freshness, report_root=report_root)
     core = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "purpose": "content_bound_lifecycle_authorization",
         "created_at": created_at,
         "catalog_schema_version": CATALOG_SCHEMA_VERSION,
+        "lifecycle_evidence_valid_through_utc": freshness[
+            "lifecycle_evidence_valid_through_utc"
+        ],
         "artifacts": artifacts,
         "config": {
             "path": str(config_path.resolve()),
@@ -171,6 +361,8 @@ def build_bundle_payload(
             "episode_boundary_evidence_sha256": artifacts[
                 "episode_first_observed_trades.json"
             ]["sha256"],
+            "lifecycle_freshness_id": freshness["freshness_id"],
+            "lifecycle_freshness_sha256": artifacts["lifecycle_freshness.json"]["sha256"],
         },
     }
     return {**core, "bundle_id": content_identity(core)}
@@ -296,6 +488,8 @@ def _verify_catalog_evidence_consistency(
     scope_registry: dict[str, Any],
     noncanonical_candidates: list[str],
     announcement_audit: dict[str, Any],
+    delisting_records: list[dict[str, Any]],
+    candidate_identities: list[str] | None = None,
 ) -> None:
     archive_by_symbol = {row.get("symbol"): row for row in archive_rows}
     if len(archive_by_symbol) != len(archive_rows) or set(catalog["symbol"]) != set(
@@ -313,10 +507,21 @@ def _verify_catalog_evidence_consistency(
         if item.get("match_status")
         in {"accepted", "ambiguous_multiple_applicable_articles"}
     ]
-    candidates = sorted(set(archive_by_symbol) | set(noncanonical_candidates))
+    candidates = sorted(
+        candidate_identities
+        if candidate_identities is not None
+        else set(archive_by_symbol) | set(noncanonical_candidates)
+    )
     scope_by_identity = verify_scope_registry(
         scope_registry, candidates, require_independent_review=False
     )
+    expected_catalog_symbols = {
+        symbol
+        for symbol, scope in scope_by_identity.items()
+        if scope.get("product_scope") in {"in_scope_crypto_perpetual", "benchmark_only"}
+    }
+    if not expected_catalog_symbols.issubset(archive_by_symbol):
+        raise ValueError("Lifecycle catalog lacks an explicit row for a reviewed in-scope candidate")
     trade_by_symbol = {row.get("symbol"): row for row in first_trades}
     if len(trade_by_symbol) != len(first_trades):
         raise ValueError("First-observed-trade evidence contains duplicate identities")
@@ -346,14 +551,21 @@ def _verify_catalog_evidence_consistency(
                 raise ValueError("Catalog scope classification disagrees with bound registry")
         archive = archive_by_symbol[symbol]
         observed = archive.get("observed_archive_object_keys")
-        if type(observed) is not list or not observed:
-            raise ValueError("Archive evidence lacks observed ZIP objects")
-        identities = [validate_archive_object_key(key) for key in observed]
-        if any(identity.symbol != symbol for identity in identities):
-            raise ValueError("Archive evidence contains a mismatched object identity")
-        periods = sorted(identity.period for identity in identities)
-        if row.get("first_archive_month") != periods[0] or row.get("last_archive_month") != periods[-1]:
-            raise ValueError("Catalog archive bounds disagree with observed ZIP evidence")
+        frontier_only = archive.get("archive_discovery_provenance") == (
+            "frontier_daily_candidate_only_no_monthly_archive_blocking"
+        )
+        if frontier_only:
+            if observed != [] or row.get("historical_inclusion_readiness") != "blocked":
+                raise ValueError("Frontier-only archive rows must remain explicitly blocked")
+        else:
+            if type(observed) is not list or not observed:
+                raise ValueError("Archive evidence lacks observed ZIP objects")
+            identities = [validate_archive_object_key(key) for key in observed]
+            if any(identity.symbol != symbol for identity in identities):
+                raise ValueError("Archive evidence contains a mismatched object identity")
+            periods = sorted(identity.period for identity in identities)
+            if row.get("first_archive_month") != periods[0] or row.get("last_archive_month") != periods[-1]:
+                raise ValueError("Catalog archive bounds disagree with observed ZIP evidence")
         if row.get("scope_classification_complete") is True:
             for dimension, field in (
                 ("stablecoin_underlying", "is_stablecoin_underlying"),
@@ -412,6 +624,24 @@ def _verify_catalog_evidence_consistency(
             ]
             if len(matching) != 1:
                 raise ValueError("Catalog delisting cutoff lacks accepted announcement evidence")
+        for cutoff in delisting_records:
+            if cutoff.get("symbol") != symbol or cutoff.get("review_status") != "accepted_exact_cutoff":
+                continue
+            matching = [
+                item
+                for item in accepted_announcements
+                if item.get("event_type") == "delisting"
+                and item.get("symbol") == symbol
+                and item.get("article_code") == cutoff.get("article_code")
+            ]
+            if len(matching) != 1 or matching[0].get("raw_snapshot_sha256") != cutoff.get(
+                "raw_article_sha256"
+            ):
+                raise ValueError("Reviewed delisting cutoff does not bind the exact article detail")
+            if matching[0].get("article_published_at") != cutoff.get(
+                "official_publication_timestamp"
+            ) or matching[0].get("official_event_at") != cutoff.get("terminal_last_trading_at"):
+                raise ValueError("Reviewed delisting cutoff semantics disagree with article detail")
 
 
 def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
@@ -440,6 +670,7 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         "lifecycle_daily_trade_boundaries.json",
         "primitive_evidence_manifest.json",
         "episode_first_observed_trades.json",
+        "lifecycle_freshness.json",
         "historical_delisting_cutoff_registry.json",
         "delisting_registry_independent_review.json",
         "independent_eligibility_verification_report.json",
@@ -488,16 +719,16 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         noncanonical.get("prefixes")
     ) is not list:
         raise ValueError("Noncanonical archive queue is malformed")
-    candidates = sorted(
-        {row.get("symbol") for row in archive_rows} | set(noncanonical["prefixes"])
-    )
+    inventory = json.loads(resolved["candidate_inventory.json"].read_text("utf-8"))
+    candidates = inventory.get("candidate_identities")
+    if type(candidates) is not list:
+        raise ValueError("Candidate inventory identities are malformed")
     verify_scope_registry(
         scope_registry,
         candidates,
         registry_path=resolved["historical_scope_registry.json"],
         repository_root=config_path.parent.parent,
     )
-    inventory = json.loads(resolved["candidate_inventory.json"].read_text("utf-8"))
     primitive = json.loads(
         resolved["primitive_evidence_manifest.json"].read_text("utf-8")
     )
@@ -513,6 +744,24 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
     episodes = json.loads(
         resolved["episode_first_observed_trades.json"].read_text("utf-8")
     )
+    freshness = json.loads(resolved["lifecycle_freshness.json"].read_text("utf-8"))
+    validate_lifecycle_freshness(freshness, report_root=path.parent)
+    if bundle.get("lifecycle_evidence_valid_through_utc") != freshness[
+        "lifecycle_evidence_valid_through_utc"
+    ]:
+        raise ValueError("Lifecycle bundle horizon disagrees with lifecycle freshness")
+    observed_corpus = cms_corpus_binding(announcement_audit)
+    if freshness["announcement_corpus"]["identity"] != observed_corpus["identity"]:
+        raise ValueError("Lifecycle freshness does not bind the complete CMS corpus")
+    observed_started = pd.Timestamp(announcement_audit.get("rebuild_started_at"))
+    if observed_started.tzinfo is None:
+        observed_started = observed_started.tz_localize("UTC")
+    else:
+        observed_started = observed_started.tz_convert("UTC")
+    if freshness["announcement_corpus"]["acquisition_started_at_utc"] != observed_started.isoformat().replace(
+        "+00:00", "Z"
+    ):
+        raise ValueError("Lifecycle freshness CMS acquisition-start evidence is stale")
     adjudications = json.loads(resolved["lifecycle_adjudications.json"].read_text("utf-8"))
     primitive_core = {key: value for key, value in primitive.items() if key != "manifest_id"}
     replay_core = {
@@ -549,6 +798,8 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         "episode_boundary_evidence_sha256": artifacts[
             "episode_first_observed_trades.json"
         ]["sha256"],
+        "lifecycle_freshness_id": freshness.get("freshness_id"),
+        "lifecycle_freshness_sha256": artifacts["lifecycle_freshness.json"]["sha256"],
     }
     expected_replay = run_eligibility_oracle(
         path.parent,
@@ -564,9 +815,28 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         or replay.get("final_status") != "PASS"
         or adjudications.get("adjudication_id") != content_identity(adjudication_core)
         or inventory.get("candidate_set_digest") != scope_registry.get("candidate_set_digest")
+        or inventory.get("candidate_set_digest") != candidate_set_digest(
+            inventory.get("candidate_identities", [])
+        )
+        or inventory.get("inventory_id") != content_identity(
+            {key: value for key, value in inventory.items() if key != "inventory_id"}
+        )
         or chain != expected_chain
     ):
         raise ValueError("Lifecycle authorization chain is invalid")
+    from alt_hot_scanner.universe.evidence_replay import run_full_evidence_replay
+
+    replay_adjudications = load_lifecycle_adjudications(
+        resolved["lifecycle_adjudications.json"],
+        candidate_set_digest=inventory["candidate_set_digest"],
+    )
+    full_replay = run_full_evidence_replay(
+        path.parent,
+        repository_root=config_path.parent.parent,
+        lifecycle_adjudications=replay_adjudications,
+    )
+    if type(full_replay) is not dict or full_replay.get("status") != "PASS":
+        raise ValueError("Canonical full lifecycle evidence replay did not pass")
     _verify_catalog_evidence_consistency(
         catalog,
         classification,
@@ -576,6 +846,8 @@ def verify_lifecycle_bundle(bundle_path: str | Path) -> dict[str, Any]:
         scope_registry,
         noncanonical["prefixes"],
         announcement_audit,
+        delisting.get("records", []),
+        candidate_identities=candidates,
     )
     unresolved_noncanonical = [
         identity

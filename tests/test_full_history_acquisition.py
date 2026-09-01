@@ -5,6 +5,8 @@ import io
 import json
 import os
 import subprocess
+import sys
+import urllib.parse
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -20,6 +22,7 @@ from alt_hot_scanner.data.acquisition import (
     ACQUISITION_EXECUTABLE_PATHS,
     ATTEMPT_SCHEMA_VERSION,
     LIFECYCLE_CRITICAL_PATHS,
+    PLAN_SCHEMA_VERSION,
     AcquisitionInvariantError,
     SourceEntry,
     acquire_api_source,
@@ -30,6 +33,7 @@ from alt_hot_scanner.data.acquisition import (
     build_raw_completion_manifest,
     classify_gaps,
     classify_raw_conflict,
+    create_run_identity,
     derived_gate,
     digest_json,
     discover_daily_1h_objects,
@@ -38,13 +42,16 @@ from alt_hot_scanner.data.acquisition import (
     replay_daily_discovery_pages,
     require_complete_attempt_manifest,
     require_gate_pass,
+    select_cutoff_exclusive_utc,
     validate_acquisition_archive_key,
     validate_api_tail,
+    validate_cutoff_against_lifecycle_horizon,
     validate_daily_kline_object_key,
     verify_acquisition_authorization,
+    verify_frozen_plan,
     verify_lifecycle_runtime_boundary,
 )
-from alt_hot_scanner.data.binance_public import validate_archive_object_key
+from alt_hot_scanner.data.binance_public import INDEX_HOST, validate_archive_object_key
 from alt_hot_scanner.data.full_history import (
     build_4h_stage,
     build_lifecycle_stage,
@@ -76,6 +83,423 @@ def _xml(*, prefix: str, prefixes: list[str] | None = None, keys: list[str] | No
         f"<IsTruncated>{str(truncated).lower()}</IsTruncated>{common}{contents}{next_token}"
         "</ListBucketResult>"
     ).encode()
+
+
+def test_cutoff_horizon_comparison_accepts_equality_and_older_cutoffs() -> None:
+    assert PLAN_SCHEMA_VERSION == "full-history-mixed-source-plan-v2"
+    assert validate_cutoff_against_lifecycle_horizon(
+        "2026-09-01T00:00:00Z", "2026-09-01T00:00:00Z"
+    )[0].isoformat() == "2026-09-01T00:00:00+00:00"
+    assert validate_cutoff_against_lifecycle_horizon(
+        "2026-08-31T12:00:00Z", "2026-09-01T00:00:00Z"
+    )[0].isoformat() == "2026-08-31T12:00:00+00:00"
+
+
+def test_cutoff_horizon_comparison_fails_closed_for_invalid_or_future_values() -> None:
+    with pytest.raises(AcquisitionInvariantError, match="must not exceed"):
+        validate_cutoff_against_lifecycle_horizon(
+            "2026-09-01T01:00:00Z", "2026-09-01T00:00:00Z"
+        )
+    with pytest.raises(AcquisitionInvariantError, match="malformed|timezone-aware"):
+        validate_cutoff_against_lifecycle_horizon(
+            "2026-09-01T00:00:00Z", "2026-09-01T00:00:00"
+        )
+    with pytest.raises(AcquisitionInvariantError, match="must be UTC"):
+        validate_cutoff_against_lifecycle_horizon(
+            "2026-09-01T00:00:00+01:00", "2026-09-01T00:00:00Z"
+        )
+    with pytest.raises(AcquisitionInvariantError, match="exact completed-1H"):
+        validate_cutoff_against_lifecycle_horizon(
+            "2026-09-01T00:01:00Z", "2026-09-01T01:00:00Z"
+        )
+
+
+def test_cutoff_selection_never_clamps_and_supports_explicit_older_cutoff() -> None:
+    latest = "2026-09-01T22:00:00Z"
+    horizon = "2026-09-01T00:00:00Z"
+    with pytest.raises(AcquisitionInvariantError, match="must not exceed lifecycle"):
+        select_cutoff_exclusive_utc(
+            latest_completed_utc=latest,
+            lifecycle_evidence_valid_through_utc=horizon,
+        )
+    assert select_cutoff_exclusive_utc(
+        latest_completed_utc=latest,
+        lifecycle_evidence_valid_through_utc=horizon,
+        requested_cutoff_exclusive_utc="2026-08-31T12:00:00Z",
+    ) == "2026-08-31T12:00:00Z"
+    with pytest.raises(AcquisitionInvariantError, match="latest completed"):
+        select_cutoff_exclusive_utc(
+            latest_completed_utc=latest,
+            lifecycle_evidence_valid_through_utc="2026-09-02T00:00:00Z",
+            requested_cutoff_exclusive_utc="2026-09-02T00:00:00Z",
+        )
+    assert select_cutoff_exclusive_utc(
+        latest_completed_utc="2026-09-01T00:00:00Z",
+        lifecycle_evidence_valid_through_utc=horizon,
+        requested_cutoff_exclusive_utc="2026-09-01T00:00:00Z",
+    ) == "2026-09-01T00:00:00Z"
+
+
+def test_create_run_identity_preserves_exact_cutoff_and_bundle_horizon() -> None:
+    identity = create_run_identity(
+        cutoff_exclusive_utc="2026-08-31T12:00:00Z",
+        lifecycle_evidence_valid_through_utc="2026-09-01T00:00:00Z",
+        lifecycle_bundle_id="bundle",
+        lifecycle_approval_id="approval",
+        lifecycle_evidence_code_commit="lifecycle-commit",
+        acquisition_executable_commit="acquisition-commit",
+        acquisition_executable_tree_sha256="a" * 64,
+        acquisition_authorization_id="authorization",
+        config_sha256="b" * 64,
+        source_inventory_sha256="c" * 64,
+        split_definitions={},
+        run_id="run",
+    )
+    assert identity.cutoff_exclusive_utc == "2026-08-31T12:00:00Z"
+    assert identity.lifecycle_evidence_valid_through_utc == "2026-09-01T00:00:00Z"
+
+
+def _minimal_v2_plan(
+    tmp_path: Path,
+    *,
+    cutoff: str,
+    horizon: str,
+    server_latest: str,
+) -> tuple[Path, dict[str, Path]]:
+    paths = {}
+    for name in ("bundle.json", "approval.json", "acquisition.json"):
+        path = tmp_path / name
+        path.write_text("{}", encoding="utf-8")
+        paths[name] = path
+    server_path = tmp_path / "server-time.json"
+    server_ms = int(pd.Timestamp(server_latest).timestamp() * 1000) + 1
+    server_path.write_bytes(json.dumps({"serverTime": server_ms}, separators=(",", ":")).encode())
+    paths["server-time.json"] = server_path
+    inventory = {
+        "schema_version": "source-inventory-v2",
+        "source_policy_version": "monthly-daily-api-v2",
+        "entries": [],
+        "inventory_sha256": digest_json([]),
+    }
+    run = {
+        "cutoff_exclusive_utc": cutoff,
+        "lifecycle_evidence_valid_through_utc": horizon,
+        "lifecycle_bundle_id": "bundle",
+        "lifecycle_approval_id": "approval",
+        "lifecycle_evidence_code_commit": "lifecycle-commit",
+        "acquisition_executable_commit": "acquisition-commit",
+        "acquisition_executable_tree_sha256": "a" * 64,
+        "acquisition_authorization_id": "authorization",
+        "config_sha256": "b" * 64,
+        "source_inventory_sha256": inventory["inventory_sha256"],
+        "source_policy_version": "monthly-daily-api-v2",
+        "split_definitions": {},
+        "run_id": "run",
+    }
+    core = {
+        "schema_version": PLAN_SCHEMA_VERSION,
+        "purpose": "authorized_full_history_mixed_source_acquisition",
+        "run_identity": run,
+        "lifecycle_bundle": str(paths["bundle.json"].resolve()),
+        "lifecycle_approval": str(paths["approval.json"].resolve()),
+        "acquisition_authorization": str(paths["acquisition.json"].resolve()),
+        "source_inventory": inventory,
+        "monthly_daily_boundary_utc": "2026-01-01T00:00:00+00:00",
+        "server_time_evidence": {
+            "path": str(server_path.resolve()),
+            "sha256": hashlib.sha256(server_path.read_bytes()).hexdigest(),
+        },
+        "daily_discovery_pages": [],
+    }
+    plan = {**core, "plan_integrity": digest_json(core)}
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    return plan_path, paths
+
+
+def _stub_frozen_plan_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    horizon: str,
+) -> None:
+    from alt_hot_scanner.data import acquisition
+
+    candidate_path = tmp_path / "candidate_inventory.json"
+    archive_path = tmp_path / "archive_observations.json"
+    candidate_path.write_text(json.dumps({"candidate_identities": []}), encoding="utf-8")
+    archive_path.write_text("[]", encoding="utf-8")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("config", encoding="utf-8")
+    verified = {
+        "bundle": {
+            "bundle_id": "bundle",
+            "lifecycle_evidence_valid_through_utc": horizon,
+            "config": {"sha256": "b" * 64},
+        },
+        "config_path": config_path,
+        "catalog": pd.DataFrame(
+            {"symbol": pd.Series(dtype=str), "historical_inclusion_readiness": pd.Series(dtype=str)}
+        ),
+        "artifacts": {
+            "candidate_inventory.json": candidate_path,
+            "archive_observations.json": archive_path,
+        },
+    }
+    approval = {
+        "approval": {
+            "approval_id": "approval",
+            "lifecycle_evidence_code_commit": "lifecycle-commit",
+        }
+    }
+    auth = {
+        "authorization_id": "authorization",
+        "acquisition_executable_commit": "acquisition-commit",
+        "acquisition_tree_sha256": "a" * 64,
+    }
+    monkeypatch.setattr(
+        "alt_hot_scanner.universe.authorization.verify_lifecycle_bundle",
+        lambda _path: verified,
+    )
+    monkeypatch.setattr(
+        "alt_hot_scanner.universe.authorization.verify_approval_pin",
+        lambda _path, _bundle: approval,
+    )
+    monkeypatch.setattr(acquisition, "verify_lifecycle_runtime_boundary", lambda *_: None)
+    monkeypatch.setattr(acquisition, "verify_acquisition_authorization", lambda *_: auth)
+
+
+def _frozen_daily_pages(
+    tmp_path: Path, symbol: str, period: str
+) -> tuple[list[dict[str, object]], Path]:
+    root = "data/futures/um/daily/klines/"
+    symbol_prefix = f"{root}{symbol}/"
+    one_hour_prefix = f"{symbol_prefix}1h/"
+    object_key = f"{one_hour_prefix}{symbol}-1h-{period}.zip"
+    pages = [
+        (
+            f"{INDEX_HOST}?list-type=2&prefix={urllib.parse.quote(root, safe='')}&delimiter=%2F",
+            _xml(prefix=root, prefixes=[symbol_prefix]),
+        ),
+        (
+            f"{INDEX_HOST}?list-type=2&prefix={urllib.parse.quote(one_hour_prefix, safe='')}",
+            _xml(prefix=one_hour_prefix, keys=[object_key, f"{object_key}.CHECKSUM"]),
+        ),
+    ]
+    records: list[dict[str, object]] = []
+    symbol_page_path = tmp_path / f"{symbol}-{period}.xml"
+    for sequence, (url, payload) in enumerate(pages, start=1):
+        path = tmp_path / f"frozen-{sequence}.xml"
+        path.write_bytes(payload)
+        if sequence == 2:
+            symbol_page_path = path
+        records.append(
+            {
+                "sequence": sequence,
+                "page": 1,
+                "url": url,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "path": str(path.resolve()),
+            }
+        )
+    return records, symbol_page_path
+
+
+def _resign_plan(plan_path: Path, plan: dict[str, object]) -> None:
+    core = {key: value for key, value in plan.items() if key != "plan_integrity"}
+    plan["plan_integrity"] = digest_json(core)
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+
+def test_frozen_plan_replays_post_cutoff_unknown_root_but_rejects_backfilled_old_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, _ = _minimal_v2_plan(
+        tmp_path,
+        cutoff="2026-09-01T00:00:00Z",
+        horizon="2026-09-01T00:00:00Z",
+        server_latest="2026-09-01T22:00:00Z",
+    )
+    _stub_frozen_plan_verification(monkeypatch, tmp_path, horizon="2026-09-01T00:00:00Z")
+    from alt_hot_scanner.data import acquisition
+    from alt_hot_scanner.universe import contracts
+    from alt_hot_scanner.utils import config as config_module
+
+    monkeypatch.setattr(contracts, "filter_instrument_scope", lambda catalog, _stable: catalog)
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda _path: {"data": {"start": "2026-01-01"}, "universe": {"stablecoin_underlyings": []}},
+    )
+    monkeypatch.setattr(acquisition, "verify_source_policy", lambda *_: None)
+
+    symbol = "BACKFILLUSDT"
+    pages, symbol_page_path = _frozen_daily_pages(tmp_path, symbol, "2026-09-01")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["daily_discovery_pages"] = pages
+    plan["monthly_daily_boundary_utc"] = "2026-09-01T00:00:00+00:00"
+    _resign_plan(plan_path, plan)
+
+    verified = verify_frozen_plan(plan_path, tmp_path)
+    assert verified["source_entries"] == []
+
+    old_object = (
+        f"data/futures/um/daily/klines/{symbol}/1h/{symbol}-1h-2026-08-31.zip"
+    )
+    old_payload = _xml(
+        prefix=f"data/futures/um/daily/klines/{symbol}/1h/",
+        keys=[old_object, f"{old_object}.CHECKSUM"],
+    )
+    symbol_page_path.write_bytes(old_payload)
+    plan["daily_discovery_pages"][1]["sha256"] = hashlib.sha256(old_payload).hexdigest()
+    _resign_plan(plan_path, plan)
+
+    with pytest.raises(AcquisitionInvariantError, match=symbol):
+        verify_frozen_plan(plan_path, tmp_path)
+
+
+def test_v2_frozen_plan_accepts_explicit_older_cutoff_with_later_server_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, _ = _minimal_v2_plan(
+        tmp_path,
+        cutoff="2026-09-01T00:00:00Z",
+        horizon="2026-09-01T00:00:00Z",
+        server_latest="2026-09-01T22:00:00Z",
+    )
+    _stub_frozen_plan_verification(monkeypatch, tmp_path, horizon="2026-09-01T00:00:00Z")
+    from alt_hot_scanner.data import acquisition
+    from alt_hot_scanner.universe import contracts
+    from alt_hot_scanner.utils import config as config_module
+
+    monkeypatch.setattr(acquisition, "replay_daily_discovery_pages", lambda _pages: ([], []))
+    monkeypatch.setattr(contracts, "filter_instrument_scope", lambda catalog, _stable: catalog)
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda _path: {"data": {"start": "2026-01-01"}, "universe": {"stablecoin_underlyings": []}},
+    )
+    expected_inventory = {
+        "schema_version": "source-inventory-v2",
+        "source_policy_version": "monthly-daily-api-v2",
+        "entries": [],
+        "inventory_sha256": digest_json([]),
+    }
+    monkeypatch.setattr(
+        acquisition,
+        "build_mixed_source_inventory",
+        lambda **kwargs: (expected_inventory, "2026-01-01T00:00:00+00:00"),
+    )
+    monkeypatch.setattr(acquisition, "verify_source_policy", lambda *_: None)
+    verified = verify_frozen_plan(plan_path, tmp_path)
+    assert verified["plan"]["run_identity"]["cutoff_exclusive_utc"] == "2026-09-01T00:00:00Z"
+
+
+@pytest.mark.parametrize(
+    ("cutoff", "horizon", "server_latest"),
+    [
+        ("2026-09-01T01:00:00Z", "2026-09-01T00:00:00Z", "2026-09-01T22:00:00Z"),
+        ("2026-09-01T00:00:00Z", "2026-09-01T02:00:00Z", "2026-08-31T23:00:00Z"),
+    ],
+)
+def test_resigned_plan_cannot_tamper_cutoff_or_horizon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cutoff: str,
+    horizon: str,
+    server_latest: str,
+) -> None:
+    plan_path, _ = _minimal_v2_plan(
+        tmp_path,
+        cutoff=cutoff,
+        horizon=horizon,
+        server_latest=server_latest,
+    )
+    _stub_frozen_plan_verification(monkeypatch, tmp_path, horizon=horizon)
+    with pytest.raises(AcquisitionInvariantError, match="lifecycle_evidence|latest"):
+        verify_frozen_plan(plan_path, tmp_path)
+
+
+def test_resigned_plan_cannot_change_lifecycle_horizon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path, _ = _minimal_v2_plan(
+        tmp_path,
+        cutoff="2026-09-01T00:00:00Z",
+        horizon="2026-09-02T00:00:00Z",
+        server_latest="2026-09-02T22:00:00Z",
+    )
+    _stub_frozen_plan_verification(monkeypatch, tmp_path, horizon="2026-09-01T00:00:00Z")
+    with pytest.raises(AcquisitionInvariantError, match="horizon"):
+        verify_frozen_plan(plan_path, tmp_path)
+
+
+def test_v1_plan_is_not_accepted_as_v2(tmp_path: Path) -> None:
+    plan_path = tmp_path / "v1-plan.json"
+    plan_path.write_text(json.dumps({"schema_version": "full-history-mixed-source-plan-v1"}))
+    with pytest.raises(AcquisitionInvariantError, match="schema"):
+        verify_frozen_plan(plan_path, tmp_path)
+
+
+def test_default_horizon_failure_happens_before_daily_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import prepare_full_manifest
+
+    source_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setattr(
+        prepare_full_manifest,
+        "verify_lifecycle_bundle",
+        lambda _path: {
+            "bundle": {
+                "bundle_id": "bundle",
+                "lifecycle_evidence_valid_through_utc": "2026-09-01T00:00:00Z",
+                "config": {"sha256": "a" * 64},
+            },
+            "config_path": (source_root / "config/research_v0_1.yaml").resolve(),
+            "readiness": {"authorization_ready": True},
+            "catalog": pd.DataFrame(),
+        },
+    )
+    monkeypatch.setattr(
+        prepare_full_manifest,
+        "verify_approval_pin",
+        lambda _path, _verified: {
+            "approval": {
+                "approval_id": "approval",
+                "lifecycle_evidence_code_commit": "lifecycle-commit",
+            }
+        },
+    )
+    monkeypatch.setattr(prepare_full_manifest, "verify_lifecycle_runtime_boundary", lambda *_: None)
+    monkeypatch.setattr(
+        prepare_full_manifest,
+        "verify_acquisition_authorization",
+        lambda *_: {"acquisition_executable_commit": "acquisition-commit"},
+    )
+    monkeypatch.setattr(
+        prepare_full_manifest,
+        "fetch_frozen_cutoff",
+        lambda: ("2026-09-01T22:00:00+00:00", b'{"serverTime":0}'),
+    )
+    monkeypatch.setattr(
+        prepare_full_manifest,
+        "discover_daily_1h_objects",
+        lambda **_: pytest.fail("daily discovery must not run before horizon validation"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prepare_full_manifest.py",
+            "--bundle",
+            "bundle.json",
+            "--approval",
+            "approval.json",
+            "--acquisition-authorization",
+            "acquisition.json",
+        ],
+    )
+    with pytest.raises(AcquisitionInvariantError, match="must not exceed lifecycle"):
+        prepare_full_manifest.main()
 
 
 def test_lifecycle_parser_stays_monthly_only_and_acquisition_parser_owns_daily() -> None:
@@ -133,6 +557,230 @@ def test_daily_pagination_reaches_late_page_and_frozen_pages_replay(tmp_path: Pa
     assert [asdict(item) for item in replayed] == [asdict(item) for item in identities]
     assert len(evidence) == len(replay_evidence) == 4
     assert any("continuation-token=page+2" in url for url in calls)
+
+
+@pytest.mark.parametrize("symbol", ["EMPTYUSDT", "EMPTYUSDC"])
+def test_empty_unknown_daily_prefix_is_retained_without_candidate_failure(
+    symbol: str,
+) -> None:
+    root = "data/futures/um/daily/klines/"
+    empty_prefix = f"{root}{symbol}/"
+    empty_1h_prefix = f"{empty_prefix}1h/"
+
+    def reader(url: str) -> bytes:
+        if "delimiter=%2F" in url:
+            return _xml(prefix=root, prefixes=[empty_prefix])
+        assert f"{symbol}%2F1h%2F" in url
+        return _xml(prefix=empty_1h_prefix)
+
+    identities, evidence = discover_daily_1h_objects(reader=reader)
+    assert identities == []
+    assert evidence[0]["discovered_symbol_prefixes"] == [symbol]
+    inventory, _ = build_mixed_source_inventory(
+        monthly_keys=[],
+        daily_identities=identities,
+        approved_symbols=set(),
+        frozen_candidate_universe=set(),
+        warmup_start_month="2026-01",
+        cutoff_exclusive_utc="2026-02-01T00:00:00Z",
+        daily_discovery_evidence=evidence,
+        lifecycle_catalog=pd.DataFrame(),
+    )
+    assert inventory["entries"] == []
+
+
+def test_replayed_empty_unknown_daily_prefix_is_retained_without_candidate_failure(tmp_path: Path) -> None:
+    root = "data/futures/um/daily/klines/"
+    symbol_prefix = f"{root}EMPTYUSDT/"
+    one_hour_prefix = f"{symbol_prefix}1h/"
+    pages = [
+        {"sequence": 1, "page": 1, "url": "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?list-type=2&prefix=data%2Ffutures%2Fum%2Fdaily%2Fklines%2F&delimiter=%2F", "payload": _xml(prefix=root, prefixes=[symbol_prefix])},
+        {"sequence": 2, "page": 1, "url": f"https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?list-type=2&prefix={urllib.parse.quote(one_hour_prefix, safe='')}", "payload": _xml(prefix=one_hour_prefix)},
+    ]
+    frozen = []
+    for record in pages:
+        path = tmp_path / f"{record['sequence']}-empty-daily.xml"
+        path.write_bytes(record["payload"])
+        frozen.append(
+            {
+                "sequence": record["sequence"],
+                "page": record["page"],
+                "url": record["url"],
+                "sha256": hashlib.sha256(record["payload"]).hexdigest(),
+                "path": str(path.resolve()),
+            }
+        )
+    try:
+        identities, evidence = replay_daily_discovery_pages(frozen)
+        assert identities == []
+        assert evidence[0]["discovered_symbol_prefixes"] == ["EMPTYUSDT"]
+        inventory, _ = build_mixed_source_inventory(
+            monthly_keys=[],
+            daily_identities=identities,
+            approved_symbols=set(),
+            frozen_candidate_universe=set(),
+            warmup_start_month="2026-01",
+            cutoff_exclusive_utc="2026-02-01T00:00:00Z",
+            daily_discovery_evidence=evidence,
+            lifecycle_catalog=pd.DataFrame(),
+        )
+        assert inventory["entries"] == []
+    finally:
+        path.unlink()
+
+
+@pytest.mark.parametrize("prefix", ["BAD SYMBOLUSDT", "UNKNOWNUSDT/extra", "BAD SYMBOLUSDC"])
+def test_malformed_root_prefix_is_not_a_temporal_identity_assertion(prefix: str) -> None:
+    inventory, _ = build_mixed_source_inventory(
+        monthly_keys=[],
+        daily_identities=[],
+        approved_symbols=set(),
+        frozen_candidate_universe=set(),
+        warmup_start_month="2026-01",
+        cutoff_exclusive_utc="2026-02-01T00:00:00Z",
+        daily_discovery_evidence=[
+            {"sha256": "a" * 64, "discovered_symbol_prefixes": [prefix]}
+        ],
+        lifecycle_catalog=pd.DataFrame(),
+    )
+    assert inventory["entries"] == []
+
+
+def test_populated_unknown_non_usdt_daily_identity_after_cutoff_is_not_fatal() -> None:
+    identity = validate_daily_kline_object_key(
+        "data/futures/um/daily/klines/EMPTYUSDC/1h/EMPTYUSDC-1h-2026-02-01.zip"
+    )
+    inventory, _ = build_mixed_source_inventory(
+        monthly_keys=[],
+        daily_identities=[identity],
+        approved_symbols=set(),
+        frozen_candidate_universe=set(),
+        warmup_start_month="2026-01",
+        cutoff_exclusive_utc="2026-02-01T00:00:00Z",
+        daily_discovery_evidence=[{"sha256": "a" * 64}],
+        lifecycle_catalog=pd.DataFrame(),
+    )
+    assert inventory["entries"] == []
+
+
+@pytest.mark.parametrize("symbol", ["UNKNOWNUSDT", "UNKNOWNUSDC"])
+def test_historically_relevant_unknown_daily_identity_is_fatal_for_all_symbols(symbol: str) -> None:
+    identity = validate_daily_kline_object_key(
+        f"data/futures/um/daily/klines/{symbol}/1h/{symbol}-1h-2024-02-03.zip"
+    )
+    with pytest.raises(AcquisitionInvariantError, match=symbol):
+        build_mixed_source_inventory(
+            monthly_keys=[],
+            daily_identities=[identity],
+            approved_symbols=set(),
+            frozen_candidate_universe=set(),
+            warmup_start_month="2024-01",
+            cutoff_exclusive_utc="2024-02-04T00:00:00Z",
+            daily_discovery_evidence=[
+                {"sha256": "a" * 64, "discovered_symbol_prefixes": [symbol]}
+            ],
+            lifecycle_catalog=pd.DataFrame(),
+        )
+
+
+def test_unknown_daily_object_starting_at_cutoff_is_not_fatal() -> None:
+    identity = validate_daily_kline_object_key(
+        "data/futures/um/daily/klines/UNKNOWNUSDT/1h/UNKNOWNUSDT-1h-2024-02-04.zip"
+    )
+    inventory, _ = build_mixed_source_inventory(
+        monthly_keys=[],
+        daily_identities=[identity],
+        approved_symbols=set(),
+        frozen_candidate_universe=set(),
+        warmup_start_month="2024-01",
+        cutoff_exclusive_utc="2024-02-04T00:00:00Z",
+        daily_discovery_evidence=[{"sha256": "a" * 64}],
+        lifecycle_catalog=pd.DataFrame(),
+    )
+    assert inventory["entries"] == []
+
+
+def test_unknown_same_date_daily_object_spanning_intraday_cutoff_is_not_fatal() -> None:
+    identity = validate_daily_kline_object_key(
+        "data/futures/um/daily/klines/UNKNOWNUSDT/1h/UNKNOWNUSDT-1h-2024-02-04.zip"
+    )
+    inventory, _ = build_mixed_source_inventory(
+        monthly_keys=[],
+        daily_identities=[identity],
+        approved_symbols=set(),
+        frozen_candidate_universe=set(),
+        warmup_start_month="2024-01",
+        cutoff_exclusive_utc="2024-02-04T12:00:00Z",
+        daily_discovery_evidence=[{"sha256": "a" * 64}],
+        lifecycle_catalog=pd.DataFrame(),
+    )
+    assert inventory["entries"] == []
+
+
+def test_unknown_root_with_historically_relevant_daily_object_is_fatal() -> None:
+    symbol = "BACKFILLUSDT"
+    identity = validate_daily_kline_object_key(
+        f"data/futures/um/daily/klines/{symbol}/1h/{symbol}-1h-2024-02-03.zip"
+    )
+    with pytest.raises(AcquisitionInvariantError, match=symbol):
+        build_mixed_source_inventory(
+            monthly_keys=[],
+            daily_identities=[identity],
+            approved_symbols=set(),
+            frozen_candidate_universe=set(),
+            warmup_start_month="2024-01",
+            cutoff_exclusive_utc="2024-02-04T00:00:00Z",
+            daily_discovery_evidence=[
+                {"sha256": "a" * 64, "discovered_symbol_prefixes": [symbol]}
+            ],
+            lifecycle_catalog=pd.DataFrame(),
+        )
+
+
+def test_known_post_cutoff_prefix_with_post_cutoff_daily_object_is_not_fatal() -> None:
+    symbol = "KNOWNUSDT"
+    identity = validate_daily_kline_object_key(
+        f"data/futures/um/daily/klines/{symbol}/1h/{symbol}-1h-2024-02-04.zip"
+    )
+    inventory, _ = build_mixed_source_inventory(
+        monthly_keys=[],
+        daily_identities=[identity],
+        approved_symbols=set(),
+        frozen_candidate_universe={symbol},
+        warmup_start_month="2024-01",
+        cutoff_exclusive_utc="2024-02-04T00:00:00Z",
+        daily_discovery_evidence=[
+            {"sha256": "a" * 64, "discovered_symbol_prefixes": [symbol]}
+        ],
+        lifecycle_catalog=pd.DataFrame(),
+    )
+    assert inventory["entries"] == []
+
+
+def test_temporal_unknown_guard_does_not_read_current_wall_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alt_hot_scanner.data import acquisition
+
+    class ClockBomb:
+        @classmethod
+        def now(cls, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("current wall clock must not affect frozen candidate validation")
+
+    monkeypatch.setattr(acquisition, "datetime", ClockBomb)
+    inventory, _ = build_mixed_source_inventory(
+        monthly_keys=[],
+        daily_identities=[],
+        approved_symbols=set(),
+        frozen_candidate_universe=set(),
+        warmup_start_month="2024-01",
+        cutoff_exclusive_utc="2024-02-04T00:00:00Z",
+        daily_discovery_evidence=[
+            {"sha256": "a" * 64, "discovered_symbol_prefixes": ["FUTUREUSDT"]}
+        ],
+        lifecycle_catalog=pd.DataFrame(),
+    )
+    assert inventory["entries"] == []
 
 
 def test_daily_discovery_rejects_zip_without_observed_checksum_sidecar() -> None:
@@ -436,7 +1084,73 @@ def _git(*args: str, cwd: Path) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
-def test_lifecycle_critical_runtime_mutation_is_rejected(tmp_path: Path) -> None:
+LIFECYCLE_PACKAGE_INITIALIZERS = (
+    "src/alt_hot_scanner/__init__.py",
+    "src/alt_hot_scanner/data/__init__.py",
+    "src/alt_hot_scanner/universe/__init__.py",
+    "src/alt_hot_scanner/utils/__init__.py",
+)
+LIFECYCLE_SUBMODULE_PATHS = tuple(
+    relative for relative in LIFECYCLE_CRITICAL_PATHS if relative not in LIFECYCLE_PACKAGE_INITIALIZERS
+)
+
+
+def _assert_lifecycle_runtime_mutation_is_rejected(tmp_path: Path, relative: str) -> None:
+    repo = tmp_path / "lifecycle-repo"
+    repo.mkdir()
+    _git("init", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    for lifecycle_relative in LIFECYCLE_CRITICAL_PATHS:
+        path = repo / lifecycle_relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"frozen {lifecycle_relative}\n", encoding="utf-8")
+    _git("add", ".", cwd=repo)
+    _git("commit", "-m", "frozen lifecycle boundary", cwd=repo)
+    commit = _git("rev-parse", "HEAD", cwd=repo)
+    verify_lifecycle_runtime_boundary(repo, commit)
+    mutated = repo / relative
+    mutated.write_text(mutated.read_text(encoding="utf-8") + "mutation\n", encoding="utf-8")
+    with pytest.raises(AcquisitionInvariantError, match="Lifecycle-critical runtime differs"):
+        verify_lifecycle_runtime_boundary(repo, commit)
+
+
+@pytest.mark.parametrize("relative", LIFECYCLE_SUBMODULE_PATHS)
+def test_lifecycle_critical_runtime_mutation_is_rejected(
+    tmp_path: Path, relative: str
+) -> None:
+    _assert_lifecycle_runtime_mutation_is_rejected(tmp_path, relative)
+
+
+@pytest.mark.parametrize("relative", LIFECYCLE_PACKAGE_INITIALIZERS)
+def test_lifecycle_package_initializer_mutation_is_rejected(
+    tmp_path: Path, relative: str
+) -> None:
+    _assert_lifecycle_runtime_mutation_is_rejected(tmp_path, relative)
+
+
+def test_untracked_lifecycle_critical_runtime_is_rejected(tmp_path: Path) -> None:
+    repo = tmp_path / "lifecycle-repo"
+    repo.mkdir()
+    _git("init", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    missing = LIFECYCLE_CRITICAL_PATHS[-1]
+    for lifecycle_relative in LIFECYCLE_CRITICAL_PATHS[:-1]:
+        path = repo / lifecycle_relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"frozen {lifecycle_relative}\n", encoding="utf-8")
+    _git("add", ".", cwd=repo)
+    _git("commit", "-m", "frozen lifecycle boundary", cwd=repo)
+    commit = _git("rev-parse", "HEAD", cwd=repo)
+    missing_path = repo / missing
+    missing_path.parent.mkdir(parents=True, exist_ok=True)
+    missing_path.write_text("untracked verifier\n", encoding="utf-8")
+    with pytest.raises(AcquisitionInvariantError, match="untracked code"):
+        verify_lifecycle_runtime_boundary(repo, commit)
+
+
+def test_acquisition_only_change_does_not_fail_lifecycle_boundary(tmp_path: Path) -> None:
     repo = tmp_path / "lifecycle-repo"
     repo.mkdir()
     _git("init", cwd=repo)
@@ -446,14 +1160,13 @@ def test_lifecycle_critical_runtime_mutation_is_rejected(tmp_path: Path) -> None
         path = repo / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"frozen {relative}\n", encoding="utf-8")
+    acquisition = repo / "src/alt_hot_scanner/data/acquisition.py"
+    acquisition.write_text("acquisition-only\n", encoding="utf-8")
     _git("add", ".", cwd=repo)
-    _git("commit", "-m", "frozen lifecycle boundary", cwd=repo)
+    _git("commit", "-m", "frozen lifecycle and acquisition boundary", cwd=repo)
     commit = _git("rev-parse", "HEAD", cwd=repo)
+    acquisition.write_text("acquisition-only mutation\n", encoding="utf-8")
     verify_lifecycle_runtime_boundary(repo, commit)
-    mutated = repo / LIFECYCLE_CRITICAL_PATHS[0]
-    mutated.write_text(mutated.read_text(encoding="utf-8") + "mutation\n", encoding="utf-8")
-    with pytest.raises(AcquisitionInvariantError, match="Lifecycle-critical runtime differs"):
-        verify_lifecycle_runtime_boundary(repo, commit)
 
 
 def test_lifecycle_boundary_and_separate_acquisition_authorization(tmp_path: Path) -> None:

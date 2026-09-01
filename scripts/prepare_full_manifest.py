@@ -14,6 +14,7 @@ from alt_hot_scanner.data.acquisition import (
     create_run_identity,
     discover_daily_1h_objects,
     fetch_frozen_cutoff,
+    select_cutoff_exclusive_utc,
     verify_acquisition_authorization,
     verify_lifecycle_runtime_boundary,
 )
@@ -45,6 +46,10 @@ def parse_args() -> argparse.Namespace:
         "--acquisition-authorization",
         required=True,
         help="Exact independent PASS authorization for the acquisition/full-build executable",
+    )
+    parser.add_argument(
+        "--cutoff-exclusive-utc",
+        help="Optional exact completed-1H UTC cutoff; defaults to Binance's latest completed hour",
     )
     return parser.parse_args()
 
@@ -79,6 +84,14 @@ def main() -> None:
     verify_lifecycle_runtime_boundary(root, lifecycle_commit)
     acquisition_auth = verify_acquisition_authorization(acquisition_auth_path, root)
 
+    lifecycle_horizon = verified["bundle"]["lifecycle_evidence_valid_through_utc"]
+    latest_completed, server_time_raw = fetch_frozen_cutoff()
+    cutoff = select_cutoff_exclusive_utc(
+        latest_completed_utc=latest_completed,
+        lifecycle_evidence_valid_through_utc=lifecycle_horizon,
+        requested_cutoff_exclusive_utc=args.cutoff_exclusive_utc,
+    )
+
     requested_config = (root / args.config).resolve()
     if requested_config != verified["config_path"]:
         raise RuntimeError("Requested config is not exact config bound into lifecycle bundle")
@@ -103,7 +116,6 @@ def main() -> None:
     evidence_root = root / "reports" / "source_discovery" / run_id
     evidence_root.mkdir(parents=True, exist_ok=False)
 
-    cutoff, server_time_raw = fetch_frozen_cutoff()
     server_time_path = evidence_root / "binance_futures_server_time.json"
     write_bytes_exclusive(server_time_path, server_time_raw)
     server_time_sha = hashlib.sha256(server_time_raw).hexdigest()
@@ -139,6 +151,7 @@ def main() -> None:
 
     run_identity = create_run_identity(
         cutoff_exclusive_utc=cutoff,
+        lifecycle_evidence_valid_through_utc=lifecycle_horizon,
         lifecycle_bundle_id=verified["bundle"]["bundle_id"],
         lifecycle_approval_id=verified_approval["approval"]["approval_id"],
         lifecycle_evidence_code_commit=lifecycle_commit,

@@ -40,19 +40,28 @@ from alt_hot_scanner.identity import require_archive_symbol_identity, require_ca
 
 SOURCE_POLICY_VERSION = "monthly-daily-api-v2"
 ACQUISITION_AUTH_SCHEMA_VERSION = "acquisition-executable-authorization-v1"
-PLAN_SCHEMA_VERSION = "full-history-mixed-source-plan-v1"
+PLAN_SCHEMA_VERSION = "full-history-mixed-source-plan-v2"
 RAW_COMPLETION_SCHEMA_VERSION = "raw-completion-manifest-v1"
 ATTEMPT_SCHEMA_VERSION = "plan-bound-attempt-manifest-v2"
 
 LIFECYCLE_CRITICAL_PATHS = (
+    "src/alt_hot_scanner/__init__.py",
+    "src/alt_hot_scanner/data/__init__.py",
+    "src/alt_hot_scanner/data/announcements.py",
     "src/alt_hot_scanner/data/binance_public.py",
+    "src/alt_hot_scanner/data/provenance.py",
     "src/alt_hot_scanner/identity.py",
+    "src/alt_hot_scanner/universe/__init__.py",
+    "src/alt_hot_scanner/universe/adjudications.py",
     "src/alt_hot_scanner/universe/authorization.py",
     "src/alt_hot_scanner/universe/contracts.py",
+    "src/alt_hot_scanner/universe/delisting_registry.py",
     "src/alt_hot_scanner/universe/eligibility.py",
     "src/alt_hot_scanner/universe/eligibility_oracle.py",
+    "src/alt_hot_scanner/universe/evidence_replay.py",
     "src/alt_hot_scanner/universe/lifecycle.py",
     "src/alt_hot_scanner/universe/scope_registry.py",
+    "src/alt_hot_scanner/utils/__init__.py",
     "src/alt_hot_scanner/utils/config.py",
     "src/alt_hot_scanner/utils/numeric.py",
 )
@@ -108,6 +117,7 @@ class SourceEntry:
 @dataclass(frozen=True)
 class FrozenRunIdentity:
     cutoff_exclusive_utc: str
+    lifecycle_evidence_valid_through_utc: str
     lifecycle_bundle_id: str
     lifecycle_approval_id: str
     lifecycle_evidence_code_commit: str
@@ -169,6 +179,69 @@ def floor_to_1h(value: pd.Timestamp | datetime) -> pd.Timestamp:
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     return ts.tz_convert("UTC").floor("h")
+
+
+def _parse_utc_boundary(value: object, field: str) -> datetime:
+    if type(value) is not str or not value:
+        raise AcquisitionInvariantError(f"{field} must be a nonempty UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise AcquisitionInvariantError(f"{field} is malformed") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise AcquisitionInvariantError(f"{field} must be timezone-aware UTC")
+    if parsed.utcoffset().total_seconds() != 0:
+        raise AcquisitionInvariantError(f"{field} must be UTC")
+    return parsed.astimezone(UTC)
+
+
+def validate_cutoff_against_lifecycle_horizon(
+    cutoff_exclusive_utc: object,
+    lifecycle_evidence_valid_through_utc: object,
+) -> tuple[datetime, datetime]:
+    """Validate the exact completed-hour cutoff against an exclusive UTC horizon."""
+    cutoff = _parse_utc_boundary(cutoff_exclusive_utc, "cutoff_exclusive_utc")
+    horizon = _parse_utc_boundary(
+        lifecycle_evidence_valid_through_utc,
+        "lifecycle_evidence_valid_through_utc",
+    )
+    if cutoff.minute or cutoff.second or cutoff.microsecond:
+        raise AcquisitionInvariantError(
+            "cutoff_exclusive_utc must be an exact completed-1H UTC boundary"
+        )
+    if cutoff > horizon:
+        raise AcquisitionInvariantError(
+            "cutoff_exclusive_utc must not exceed lifecycle_evidence_valid_through_utc"
+        )
+    return cutoff, horizon
+
+
+def select_cutoff_exclusive_utc(
+    *,
+    latest_completed_utc: str,
+    lifecycle_evidence_valid_through_utc: str,
+    requested_cutoff_exclusive_utc: str | None = None,
+) -> str:
+    """Select the server-derived or explicitly requested cutoff without clamping."""
+    latest = _parse_utc_boundary(latest_completed_utc, "latest_completed_1h_utc")
+    if latest.minute or latest.second or latest.microsecond:
+        raise AcquisitionInvariantError(
+            "latest_completed_1h_utc must be an exact completed-1H UTC boundary"
+        )
+    selected = (
+        latest_completed_utc
+        if requested_cutoff_exclusive_utc is None
+        else requested_cutoff_exclusive_utc
+    )
+    cutoff, _ = validate_cutoff_against_lifecycle_horizon(
+        selected,
+        lifecycle_evidence_valid_through_utc,
+    )
+    if cutoff > latest:
+        raise AcquisitionInvariantError(
+            "cutoff_exclusive_utc must not exceed the latest completed 1H boundary"
+        )
+    return selected
 
 
 def freeze_cutoff_from_server(server_time_ms: int) -> str:
@@ -294,6 +367,7 @@ def verify_acquisition_authorization(path: str | Path, root: str | Path) -> dict
 def create_run_identity(
     *,
     cutoff_exclusive_utc: str,
+    lifecycle_evidence_valid_through_utc: str,
     lifecycle_bundle_id: str,
     lifecycle_approval_id: str,
     lifecycle_evidence_code_commit: str,
@@ -305,9 +379,13 @@ def create_run_identity(
     split_definitions: dict[str, Any],
     run_id: str,
 ) -> FrozenRunIdentity:
-    cutoff = floor_to_1h(pd.Timestamp(cutoff_exclusive_utc)).isoformat()
+    validate_cutoff_against_lifecycle_horizon(
+        cutoff_exclusive_utc,
+        lifecycle_evidence_valid_through_utc,
+    )
     return FrozenRunIdentity(
-        cutoff,
+        cutoff_exclusive_utc,
+        lifecycle_evidence_valid_through_utc,
         lifecycle_bundle_id,
         lifecycle_approval_id,
         lifecycle_evidence_code_commit,
@@ -453,8 +531,13 @@ def discover_daily_1h_objects(
     symbol_prefixes, _, root_evidence = list_daily_archive_index(
         root, delimiter="/", reader=reader, page_observer=page_observer
     )
+    root_evidence = list(root_evidence)
+    if root_evidence:
+        root_evidence[0]["discovered_symbol_prefixes"] = [
+            prefix.removeprefix(root).rstrip("/") for prefix in symbol_prefixes
+        ]
     identities: dict[str, AcquisitionArchiveIdentity] = {}
-    evidence = list(root_evidence)
+    evidence = root_evidence
     for symbol_prefix in symbol_prefixes:
         symbol = symbol_prefix.removeprefix(root).rstrip("/")
         try:
@@ -595,6 +678,31 @@ def replay_daily_discovery_pages(
         {"sha256": record["sha256"], "url": record["url"]}
         for record in sorted(page_records, key=lambda item: item["sequence"])
     ]
+    root_page = next(
+        (
+            record
+            for record in sorted(page_records, key=lambda item: item["sequence"])
+            if urllib.parse.parse_qs(urllib.parse.urlsplit(record["url"]).query).get(
+                "prefix"
+            ) == [root]
+            and urllib.parse.parse_qs(urllib.parse.urlsplit(record["url"]).query).get(
+                "delimiter"
+            ) == ["/"]
+        ),
+        None,
+    )
+    if root_page is not None:
+        root_sequence = root_page["sequence"]
+        evidence_index = next(
+            index
+            for index, record in enumerate(
+                sorted(page_records, key=lambda item: item["sequence"])
+            )
+            if record["sequence"] == root_sequence
+        )
+        evidence[evidence_index]["discovered_symbol_prefixes"] = [
+            prefix.removeprefix(root).rstrip("/") for prefix in sorted(set(root_prefixes))
+        ]
     return sorted(identities.values(), key=lambda item: (item.symbol, item.period, item.object_key)), evidence
 
 
@@ -779,6 +887,7 @@ def build_mixed_source_inventory(
     Any missing daily day followed by a later observed day is an interior archive gap and fails.
     A missing trailing daily suffix is represented only by API requests, never by repair of history.
     """
+    daily_discovery_evidence = list(daily_discovery_evidence)
     cutoff = floor_to_1h(pd.Timestamp(cutoff_exclusive_utc))
     boundary = pd.Timestamp(year=cutoff.year, month=cutoff.month, day=1, tz="UTC")
     warmup_month = pd.Period(warmup_start_month, freq="M")
@@ -786,7 +895,8 @@ def build_mixed_source_inventory(
         {
             identity.symbol
             for identity in daily_identities
-            if identity.symbol.endswith("USDT") and identity.symbol not in frozen_candidate_universe
+            if source_period_bounds("daily", identity.period)[1] <= cutoff
+            if identity.symbol not in frozen_candidate_universe
         }
     )
     if unknown:
@@ -871,6 +981,10 @@ def create_frozen_plan(
     server_time_evidence_sha256: str,
     daily_discovery_pages: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    validate_cutoff_against_lifecycle_horizon(
+        run_identity.cutoff_exclusive_utc,
+        run_identity.lifecycle_evidence_valid_through_utc,
+    )
     if source_inventory_payload.get("inventory_sha256") != run_identity.source_inventory_sha256:
         raise AcquisitionInvariantError("Run identity source inventory digest mismatch")
     core = {
@@ -926,6 +1040,8 @@ def verify_frozen_plan(plan_path: str | Path, root: str | Path) -> dict[str, Any
     verify_lifecycle_runtime_boundary(repository, lifecycle_commit)
     acquisition_auth = verify_acquisition_authorization(auth_path, repository)
     run = plan["run_identity"]
+    if type(run) is not dict:
+        raise AcquisitionInvariantError("Run identity is malformed")
     expected_run_keys = {field.name for field in FrozenRunIdentity.__dataclass_fields__.values()}
     if set(run) != expected_run_keys:
         raise AcquisitionInvariantError("Run identity fields are not exact")
@@ -935,6 +1051,14 @@ def verify_frozen_plan(plan_path: str | Path, root: str | Path) -> dict[str, Any
         raise AcquisitionInvariantError("Run identity lifecycle approval mismatch")
     if run["lifecycle_evidence_code_commit"] != lifecycle_commit:
         raise AcquisitionInvariantError("Run identity lifecycle executable mismatch")
+    if run["lifecycle_evidence_valid_through_utc"] != verified_bundle["bundle"][
+        "lifecycle_evidence_valid_through_utc"
+    ]:
+        raise AcquisitionInvariantError("Run identity lifecycle horizon mismatch")
+    validate_cutoff_against_lifecycle_horizon(
+        run["cutoff_exclusive_utc"],
+        run["lifecycle_evidence_valid_through_utc"],
+    )
     if run["acquisition_executable_commit"] != acquisition_auth["acquisition_executable_commit"]:
         raise AcquisitionInvariantError("Run identity acquisition commit mismatch")
     if run["acquisition_authorization_id"] != acquisition_auth["authorization_id"]:
@@ -956,9 +1080,13 @@ def verify_frozen_plan(plan_path: str | Path, root: str | Path) -> dict[str, Any
     server_path = Path(server.get("path", ""))
     if not server_path.is_absolute() or not server_path.is_file() or sha256_path(server_path) != server.get("sha256"):
         raise AcquisitionInvariantError("Frozen server-time evidence is missing/changed")
-    cutoff, raw = fetch_frozen_cutoff(lambda: server_path.read_bytes())
-    if hashlib.sha256(raw).hexdigest() != server["sha256"] or cutoff != run["cutoff_exclusive_utc"]:
-        raise AcquisitionInvariantError("Frozen server-time evidence does not derive run cutoff")
+    latest_completed, raw = fetch_frozen_cutoff(lambda: server_path.read_bytes())
+    if hashlib.sha256(raw).hexdigest() != server["sha256"]:
+        raise AcquisitionInvariantError("Frozen server-time evidence hash is invalid")
+    validate_cutoff_against_lifecycle_horizon(
+        run["cutoff_exclusive_utc"],
+        latest_completed,
+    )
     # Replay frozen discovery bytes and independently reconstruct the exact canonical source plan.
     replayed_daily, discovery_evidence = replay_daily_discovery_pages(plan["daily_discovery_pages"])
     from alt_hot_scanner.universe.contracts import filter_instrument_scope

@@ -138,3 +138,30 @@ def test_restart_guard_detects_duplicate_attempt(scheduler) -> None:
     state["tasks"]["R1"]["attempts"] = 2
     scheduler.save_state(state)
     assert scheduler.restart_without_duplicate_ok(scheduler.load_state()) is False
+
+def test_cancel_queued_task_preserves_attempt_history_and_prevents_rerun(scheduler) -> None:
+    write_task(scheduler.ROOT)
+    scheduler.init_state()
+    scheduler.claim("R1")
+    scheduler.finish("R1", False, {"returncode": 1}, "expected research guard")
+    cancelled = scheduler.cancel_task("R1", "lifecycle_scope_review_required")
+    assert cancelled["status"] == "CANCELLED"
+    assert cancelled["attempts"] == 1
+    assert cancelled["cancel_reason"] == "lifecycle_scope_review_required"
+    observed = scheduler.init_state()
+    assert scheduler.next_runnable(observed) is None
+    replay = scheduler.cancel_task("R1", "ignored on idempotent replay")
+    assert replay["status"] == "CANCELLED"
+    assert replay["attempts"] == 1
+
+
+def test_cancel_running_or_completed_task_is_rejected(scheduler) -> None:
+    write_task(scheduler.ROOT)
+    scheduler.init_state()
+    scheduler.claim("R1")
+    with pytest.raises(ValueError, match="RUNNING"):
+        scheduler.cancel_task("R1", "unsafe")
+    scheduler.finish("R1", True, {"returncode": 0})
+    with pytest.raises(ValueError, match="COMPLETED"):
+        scheduler.cancel_task("R1", "too late")
+

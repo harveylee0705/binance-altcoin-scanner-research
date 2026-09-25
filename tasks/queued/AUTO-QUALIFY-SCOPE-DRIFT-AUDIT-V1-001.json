@@ -1,0 +1,30 @@
+{
+  "auto_authorized": true,
+  "command": [
+    "python",
+    "scripts/audit_scope_drift.py",
+    "--review-required",
+    "reports/lifecycle/20260925T080140648951Z_10502_a62bda06b279a193/candidate_scope_review_required.json",
+    "--inventory",
+    "reports/lifecycle/20260925T080140648951Z_10502_a62bda06b279a193/candidate_inventory.json",
+    "--output",
+    "reports/auto_runtime/scope_drift_audit_v1.json"
+  ],
+  "max_attempts": 1,
+  "mutable_resources": [
+    "scope_drift_audit_output"
+  ],
+  "priority": "P0",
+  "program_id": "SCANNER-V0.1",
+  "provider_dependencies": [],
+  "reads": [
+    "reports/lifecycle/20260925T080140648951Z_10502_a62bda06b279a193/candidate_scope_review_required.json",
+    "reports/lifecycle/20260925T080140648951Z_10502_a62bda06b279a193/candidate_inventory.json"
+  ],
+  "task_id": "AUTO-QUALIFY-SCOPE-DRIFT-AUDIT-V1-001",
+  "task_kind": "research",
+  "timeout_seconds": 60,
+  "writes": [
+    "reports/auto_runtime/scope_drift_audit_v1.json"
+  ]
+}

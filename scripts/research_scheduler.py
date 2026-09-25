@@ -289,6 +289,31 @@ def finish(task_id: str, ok: bool, result: dict[str, Any], error: str | None = N
     return task
 
 
+def cancel_task(task_id: str, reason: str) -> dict[str, Any]:
+    state = init_state()
+    task = state["tasks"].get(task_id)
+    if task is None:
+        raise ValueError(f"unknown task: {task_id}")
+    if task.get("status") == "CANCELLED":
+        return task
+    if task.get("status") == "RUNNING":
+        raise ValueError("cannot cancel a RUNNING task")
+    if task.get("status") == "COMPLETED":
+        raise ValueError("cannot cancel a COMPLETED task")
+    reason = reason.strip()
+    if not reason or len(reason) > 500:
+        raise ValueError("cancel reason must be 1..500 characters")
+    task["status"] = "CANCELLED"
+    task["cancelled_at"] = now_iso()
+    task["cancel_reason"] = reason
+    task["execution_lane"] = None
+    if state["lane"].get("primary") == task_id:
+        state["lane"]["primary"] = None
+    state["autonomy_ready"] = False
+    save_state(state)
+    return task
+
+
 def execute(task_id: str) -> dict[str, Any]:
     spec = spec_map().get(task_id)
     if spec is None:
@@ -469,6 +494,9 @@ def main() -> int:
         sub.add_parser(name)
     run = sub.add_parser("run-task")
     run.add_argument("task_id")
+    cancel = sub.add_parser("cancel-task")
+    cancel.add_argument("task_id")
+    cancel.add_argument("--reason", required=True)
     svc = sub.add_parser("service")
     svc.add_argument("action", choices=("install", "restart", "status"))
     daemon_parser = sub.add_parser("daemon")
@@ -485,6 +513,8 @@ def main() -> int:
         out = qualify_auto()
     elif args.command == "run-task":
         out = execute(args.task_id)
+    elif args.command == "cancel-task":
+        out = cancel_task(args.task_id, args.reason)
     elif args.command == "service":
         out = service_command(args.action)
     else:

@@ -1,0 +1,14 @@
+{
+  "task_id": "REPLACE-WITH-NEW-VERSIONED-TASK-ID",
+  "program_id": "SCANNER-V0.1",
+  "priority": "P0",
+  "command": ["python", "scripts/REPLACE_WITH_BOUNDED_SCRIPT.py"],
+  "timeout_seconds": 300,
+  "max_attempts": 3,
+  "writes": ["reports/REPLACE_WITH_TASK_SCOPE/"],
+  "reads": ["docs/RESEARCH_SPEC_V0_1.md"],
+  "mutable_resources": ["REPLACE_WITH_RESOURCE_ID"],
+  "provider_dependencies": [],
+  "auto_authorized": true,
+  "task_kind": "research"
+}

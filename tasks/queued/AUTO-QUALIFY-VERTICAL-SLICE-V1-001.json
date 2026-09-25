@@ -1,0 +1,33 @@
+{
+  "task_id": "AUTO-QUALIFY-VERTICAL-SLICE-V1-001",
+  "program_id": "SCANNER-V0.1",
+  "priority": "P0",
+  "command": [
+    "python",
+    "scripts/run_vertical_slice.py",
+    "--config",
+    "config/research_v0_1.yaml"
+  ],
+  "timeout_seconds": 1200,
+  "max_attempts": 2,
+  "writes": [
+    "data/raw/",
+    "data/interim/",
+    "data/processed/",
+    "reports/"
+  ],
+  "reads": [
+    "config/research_v0_1.yaml",
+    "docs/RESEARCH_SPEC_V0_1.md",
+    "src/alt_hot_scanner/",
+    "scripts/run_vertical_slice.py"
+  ],
+  "mutable_resources": [
+    "development_vertical_slice_outputs"
+  ],
+  "provider_dependencies": [
+    "Binance Public Data"
+  ],
+  "auto_authorized": true,
+  "task_kind": "research"
+}

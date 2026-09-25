@@ -6,6 +6,7 @@ __pycache__/
 .coverage
 htmlcov/
 *.egg-info/
+.auto_runtime/
 
 # Market data and generated research artifacts are local-only.
 data/raw/**
@@ -16,4 +17,3 @@ reports/**
 !data/interim/.gitkeep
 !data/processed/.gitkeep
 !reports/.gitkeep
-

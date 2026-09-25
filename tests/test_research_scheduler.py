@@ -66,16 +66,24 @@ def test_completed_task_does_not_reexecute(scheduler) -> None:
     assert scheduler.load_state()["tasks"]["R1"]["attempts"] == 1
 
 
-def test_interrupted_run_recovers_without_resetting_attempts(scheduler) -> None:
+def test_status_init_does_not_recover_live_running_task(scheduler) -> None:
     write_task(scheduler.ROOT)
     scheduler.init_state()
     scheduler.claim("R1")
-    state = scheduler.load_state()
-    assert state["tasks"]["R1"]["attempts"] == 1
-    recovered = scheduler.init_state()
+    observed = scheduler.init_state()
+    assert observed["tasks"]["R1"]["status"] == "RUNNING"
+    assert observed["lane"]["primary"] == "R1"
+
+
+def test_daemon_startup_recovery_preserves_attempt_count(scheduler) -> None:
+    write_task(scheduler.ROOT)
+    scheduler.init_state()
+    scheduler.claim("R1")
+    recovered = scheduler.recover_interrupted_runs()
     assert recovered["tasks"]["R1"]["status"] == "QUEUED"
     assert recovered["tasks"]["R1"]["attempts"] == 1
     assert recovered["tasks"]["R1"]["last_error"] == "recovered_interrupted_run"
+    assert recovered["lane"]["primary"] is None
 
 
 def test_manifest_drift_requires_decision(scheduler) -> None:
@@ -107,3 +115,26 @@ def test_only_python_repo_scripts_are_allowed(scheduler) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError, match="project Python"):
         scheduler.discover_manifests()
+
+
+def test_research_task_cannot_fake_real_work_with_pytest(scheduler) -> None:
+    path = write_task(scheduler.ROOT)
+    data = json.loads(path.read_text())
+    data["command"] = ["python", "-m", "pytest"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="bounded repository script"):
+        scheduler.discover_manifests()
+
+
+def test_restart_guard_detects_duplicate_attempt(scheduler) -> None:
+    write_task(scheduler.ROOT)
+    scheduler.execute("R1")
+    state = scheduler.load_state()
+    state["qualification"]["restart_requested_at"] = scheduler.now_iso()
+    state["qualification"]["completed_research_attempts_at_restart"] = {"R1": 1}
+    scheduler.save_state(state)
+    assert scheduler.restart_without_duplicate_ok(scheduler.load_state()) is True
+    state = scheduler.load_state()
+    state["tasks"]["R1"]["attempts"] = 2
+    scheduler.save_state(state)
+    assert scheduler.restart_without_duplicate_ok(scheduler.load_state()) is False

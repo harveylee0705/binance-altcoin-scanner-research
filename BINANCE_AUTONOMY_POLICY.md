@@ -14,7 +14,7 @@ Git history plus frozen repository artifacts are authoritative. Runtime state is
 
 ## Allowed autonomous actions
 
-The scheduler may claim and execute an approved task manifest; invoke only the repository Python interpreter against a script under `scripts/` or `python -m pytest/ruff`; record declared reads, writes, mutable resources, and provider dependencies for audit; retry failures only up to the manifest's bounded retry limit; recover interrupted tasks from durable state; and report runtime status.
+The scheduler may claim and execute an approved task manifest; invoke only the repository Python interpreter against a script under `scripts/` or `python -m pytest/ruff`; record declared reads, writes, mutable resources, and provider dependencies for audit; retry failures only up to the manifest's bounded retry limit; recover interrupted tasks from durable state at daemon startup; and report runtime status.
 
 It must not silently widen a command, provider, schema, time horizon, data split, or research question. A changed manifest under an existing task ID becomes `DECISION_REQUIRED` rather than silently replacing the old authorization. Domain-specific scripts remain responsible for enforcing their own output and data-integrity boundaries.
 
@@ -32,7 +32,8 @@ AUTO is earned only when all current checks pass:
 4. No queued manifest has drifted under an existing task ID.
 5. No task is in exhausted `FAILED` state.
 6. At least one real bounded task with `task_kind=research` has completed through the scheduler.
-7. No task is left `RUNNING` at the qualification checkpoint.
+7. A scheduler service restart has been observed after a completed research task, with no duplicate attempt of that completed task.
+8. No task is left `RUNNING` at the qualification checkpoint.
 
 AUTO is revoked whenever a required current gate stops passing. Historical qualification never overrides a current failed gate.
 
